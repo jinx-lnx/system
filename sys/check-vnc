@@ -1,0 +1,420 @@
+#!/bin/bash -u
+
+function isRoot() {
+	[ $( id -u ) -eq 0 ] && return 0
+	return 1
+}
+
+[ -f /opt/gwn/system/functions.sh ] && . /opt/gwn/system/functions.sh
+
+type -t findExe > /dev/null \
+	&& FOLD=$( findExe fold )
+
+BOLD="${BOLD:-}"
+GOOD="${GOOD:-}"
+WARN="${WARN:-}"
+BAD="${BAD:-}"
+HILITE="${HILITE:-}"
+BRACKET="${BRACKET:-}"
+STANDOUT="${STANDOUT:-}"
+NORMAL="${NORMAL:-}"
+if [ -z "${FOLD:-}" ]; then
+	FOLD=
+else
+	FOLD="${FOLD} -s"
+fi
+
+
+####################################################################################################
+# 0. Check whether we are on the correct host
+#
+# On RAS this script should only be run on the node that has the ManagementIP resource, with which
+# the Stunnel resource is colocated, which in turn should be colocated with the
+# ms_StickyMaster:Master resource. Therefore, check where the ms_StickyMaster resource is the
+# master and if we're not on that host then tell the user and exit.
+if [ -n "${CRM}" ]; then
+	# Ok, so this script is supposed to work as a standard user (and I don't think it is
+	# worth making it executable via sudo).
+	# Directly calling "locateMasterNode" is, therefore, out of the question.
+	# Instead, use should-run-on-node, which (most?) standard users can run with sudo.
+	TARGET_NODE=$(
+		if [ $( id -u ) -eq 0 ]; then
+			/opt/gwn/system/should-run-on-node appserver
+		else
+			sudo /opt/gwn/system/should-run-on-node appserver
+		fi
+	)
+	RESULT=${?}
+	case ${RESULT} in
+		0)	# Correct node, continue
+			;;
+		1)	# Not the correct node. There's two cases here:
+			# 1.) The resource is running on another node. In this
+			#     case ${TARGET_NODE} is set to the node we should
+			#     be running on
+			if [ -n "${TARGET_NODE}" ]; then
+				echo -e "${BOLD}This server is not the Master.${NORMAL}\nPlease run this script on ${HILITE}${TARGET_NODE}${NORMAL}." \
+					| ${FOLD}
+				exit 6
+			fi
+			# 2.) The resource is not running. In this case
+			#     ${TARGET_NODE} is set to an empty string (and here
+			#     we are)
+			echo -e "${BOLD}Cannot determine which server is the Master.${NORMAL}\nMost likely, VNC is not working because this RAS is not in a working state. Check with ${HILITE}system-status${NORMAL}." \
+				| ${FOLD}
+			exit 7
+			;;
+		5)	# Error talking to the cluster software
+			echo -e "${BOLD}Error talking to the cluster software.${NORMAL}\nMost likely, VNC is not working because this RAS is not in a working state. Check with ${HILITE}system-status${NORMAL}." \
+				| ${FOLD}
+			exit 8
+			;;
+		*)	# 2 - errors in parameter processing
+			# 3 - invalid node spec
+			# 4 - need to be root
+			echo -e "${BOLD}Unknown error while determining the Master.${NORMAL}\nMost likely, VNC is not working because this RAS is not in a working state. Check with ${HILITE}system-status${NORMAL}." \
+				| ${FOLD}
+			exit 8
+			;;
+	esac
+fi
+
+####################################################################################################
+# 1: Check if we still need to check anything
+#
+# PLS 7.03.x made the whole mess with SSH tunnels and tunnel pools and stunnel obsolete.
+PLS_VERSION=$( getPlsVersion )
+RESULT=${?}
+case ${RESULT} in
+	0) # Ok, we got the version. Check if we need to run
+		#                       7       Major
+		#                        003    Minor
+		#                           000 Rev
+		if [ ${PLS_VERSION} -gt 7003000 ]; then
+			REV=$(( PLS_VERSION % 1000 ))
+			PLS_VERSION=$(( PLS_VERSION / 1000 ))
+			MINOR=$(( PLS_VERSION % 1000 ))
+			MAJOR=$(( PLS_VERSION / 1000 ))
+			printTitle "" "${GOOD}"
+			printTitle "Welcome To The Future" "${GOOD}"
+			printTitle "" "${GOOD}"
+			echo -e "\n${BOLD}This server is running${NORMAL} ${HILITE}PLS ${MAJOR}.${MINOR}.${REV}${NORMAL}${BOLD}.${NORMAL}
+
+This PLS version has VNC support that works differently than before. Running this tool is no longer required.
+
+If you still have problems, make sure that you are connecting to the MC with one of the following URLs:
+" | ${FOLD}
+			STAR_DETECTED=false
+			for SERVER_NAME in $(
+				sed -n -e 's/.*server_name[ \t]*\(.*\);/\1/p' /etc/nginx/sites-enabled/appserver.conf \
+					| tr ' ' $'\n' \
+					| sort \
+					| uniq
+			); do
+				echo -e " ${GOOD}*${NORMAL} ${BOLD}https://${SERVER_NAME}/Admin${NORMAL}"
+			done
+			echo -e "\nNote: a star ("*") is a placeholder and needs to be replaced." \
+				| ${FOLD}
+			exit 0
+		fi
+		;;
+	1) # Version file not present
+		echo -e "${WARN}Warning${NORMAL}${BOLD}: Could not find the file with the PLS version.${NORMAL}\n" \
+		;;
+	2) # Version could not be parsed
+		echo -e "${WARN}Warning:${NORMAL}: ${BOLD}PLS version could not be determined.${NORMAL}\n" \
+		;;
+esac
+
+
+
+####################################################################################################
+# 2. Check whether stunnel4 is installed
+echo -en "\n${GOOD}*${NORMAL} ${BOLD}Checking whether stunnel4 is installed...${NORMAL} "
+dpkg -s stunnel4 > /dev/null 2>&1 \
+	|| die "${BAD}failed.${NORMAL}\n\nPackage \"stunnel4\" is not installed\n\nMost likely the SALT configuration for this server is incorrect.\n\nPlease contact DevOps to ensure that this server has the correct SALT configuration. Eventually, a Highstate is necessary.\n\nRerun this script after ensuring that this server is configured correctly." 1
+echo -e "${GOOD}ok.${NORMAL}"
+
+
+####################################################################################################
+# 3. Check if there is a config file for our VNC stuff. Note that we're
+#    not (yet) checking if the config file is valid, just that it's there.
+echo -en "\n${GOOD}*${NORMAL} ${BOLD}Checking if the stunnel vnc configuration file is present...${NORMAL} "
+[ -f /etc/stunnel/vnc.conf ] \
+	|| die "${BAD}failed.${NORMAL}\n\nConfiguration file \"/etc/stunnel/vnc.conf\" does not exist\n\nMost likely the SALT configuration for this server is incorrect.\n\nPlease contact DevOps to ensure that this server has the correct SALT configuration. Eventually, a Highstate is necessary.\n\nRerun this script after ensuring that this server is configured correctly." 2
+echo -e "${GOOD}ok.${NORMAL}"
+
+
+####################################################################################################
+# 4. Check if the stunnel service is started
+echo -en "\n${GOOD}*${NORMAL} ${BOLD}Checking if the stunnel4 service is running...${NORMAL} "
+if [ $( pidof stunnel4 | wc -l ) -eq 0 ]; then
+	# Don't try to restart if RAS. This needs special investigation anyway.
+	[ -n "${CRM}" ] \
+		&& die "${BAD}failed.${NORMAL}\n\nNo stunnel4 process is running on this RAS node.\n\nPlease contact DevOps to have this resource started.\n\nDevOps probably also needs to investigate why RAS is not able to keep this resource running." 3
+	# If not "root" try not to restart (we don't have permission)
+	isRoot \
+		|| die "${BAD}failed.${NORMAL}\n\nNo stunnel4 process is running\n\nPlease contact DevOps to have this service started.\n\nDevOps probably also needs to investigate why this service is not started automatically on boot." 3
+
+	# Try to restart...
+	echo -e "${WARN}failed.${NORMAL}\n\nNo stunnel4 process is running.\n\nTrying to start the service..." | ${FOLD}
+	service stunnel4 start
+	# ... check if it worked
+	echo -en "\n${GOOD}*${NORMAL} ${BOLD}Checking if the stunnel4 service started up...${NORMAL}"
+	for COUNT in {1..30}; do
+		[ $( pidof stunnel4 | wc -l ) -gt 0 ] \
+			&& break
+		echo -en "${BOLD}.${NORMAL}"
+	done
+	if [ $( pidof stunnel4 | wc -l ) -eq 0 ]; then
+		echo -e " ${BAD}failed.${NORMAL}"
+		die "\nThe service \"stunnel4\" did not start up properly. Please contact DevOps for further investigation." 3
+	fi
+	# Wait a bit more to make sure that stunnel4 had enough time to initialize
+	for COUNT in {1..3}; do
+		echo -en "."
+		sleep 1
+	done
+	echo -e " ${GOOD}ok.${NORMAL}\n\nThe \"stunnel4\" service did start up properly. However, it is also probably a good idea to investigate why the stunnel4 service was not started automatically on boot (contact DevOps)." | ${FOLD}
+
+else
+	# Ok, stunnel is running
+	echo -e " ${GOOD}ok.${NORMAL}"
+fi
+
+
+####################################################################################################
+# 5. Check if the config file was modified after the stunnel service was started.
+#    If that's the case the service may have been started with a different config
+#    than the current one.
+echo -en "\n${GOOD}*${NORMAL} ${BOLD}Checking if the stunnel4 service was started after the last change of the configuration file...${NORMAL} "
+CONFIG_LAST_MOD_TIME=$( stat --format %Y /etc/stunnel/vnc.conf )
+MODIFIED_AFTER_START=false
+for STUNNEL_PID in $( pidof stunnel4 ); do
+	if [ $( stat --format %Y /proc/${STUNNEL_PID} ) -lt ${CONFIG_LAST_MOD_TIME} ]; then
+		MODIFIED_AFTER_START=true
+	fi
+done
+if ${MODIFIED_AFTER_START}; then
+	echo -e "${WARN}no.${NORMAL}\n\nIt looks like the configuration was changed after the stunnel4 service was started.\n\nThis may or may not be a problem but usually means that the \"stunnel4\" service runs with an older configuration." | ${FOLD}
+else
+	echo -e "${GOOD}ok.${NORMAL}"
+fi
+
+
+####################################################################################################
+# 6. Check if we can connect to each of the stunnel ports and try to validate the certs
+#    Note: for the "appserver-XXXX" entries we *do* validate that we get the wildcard appserver cert
+#          while we cannot check the subject of the "managegwn-XXXX" entries. It is possible that
+#          our clients ask us to install their custom certs, in which case we cannot determine what
+#          the subject should be.
+CONFIG_FILE=/opt/wildfly/standalone/deployments/assets.war/WEB-INF/config/Configuration.xml
+if [ ! -f "${CONFIG_FILE}" ]; then
+	echo -e "\n${BAD}*${NORMAL} ${BOLD}Could not acccess\n      ${HILITE}${CONFIG_FILE}${NORMAL}\n  Make sure that the file exists and is accessible to the current user."
+	exit 9
+fi
+
+echo -en "\n${GOOD}*${NORMAL} ${BOLD}Checking if we can connect to all ports defined in Configuration.xml...${NORMAL}"
+# Grab some config info from Configuration.xml for the next tests:
+FIRST_PORT=
+FIRST_SECURE_PORT=
+POOL_SIZE=
+eval $(
+	xmlstarlet sel \
+		-t \
+		-m  "//plc-control-config" \
+			-v "concat('FIRST_PORT=',@first-forwarded-port,';')" \
+			-v "concat('POOL_SIZE=', @forwarded-ports-pool-size, ';')" \
+			-v "concat('FIRST_SECURE_PORT=',@first-forwarded-secure-port,';')" \
+		/opt/wildfly/standalone/deployments/assets.war/WEB-INF/config/Configuration.xml
+)
+
+BAD_CERT=false
+BAD_CONFIG=false
+CONNECTION_PROBLEM=false
+NO_PUBLIC_CERTS=false
+
+VNC_PARAMS_ERRORS=""
+[ -z "${FIRST_PORT}" ] \
+	&& VNC_PARAMS_ERRORS="${VNC_PARAMS_ERRORS}\n   ${BAD}*${NORMAL} ${BOLD}first-forwarded-port${NORMAL}"
+[ -z "${POOL_SIZE}" ] \
+	&& VNC_PARAMS_ERRORS="${VNC_PARAMS_ERRORS}\n   ${BAD}*${NORMAL} ${BOLD}forwarded-ports-pool-size${NORMAL}"
+# We don't check ${FIRST_SECURE_PORT} here since we are going to issue a warning later on
+if [ -n "${VNC_PARAMS_ERRORS}" ]; then
+	echo -e "\n\n${BAD}*${NORMAL} ${BOLD}The${NORMAL} ${HILITE}plc-control-config${NORMAL} ${BOLD}node in Configuration.xml does not contain the following attributes:${NORMAL}${VNC_PARAMS_ERRORS}"
+
+else
+
+	APPSERVER_FORWARDING_COUNT=$( sed -n -e 's/^\[appserver-\([0-9]*\)\]$/\1/p' /etc/stunnel/vnc.conf | wc -l )
+	MANAGEGWN_FORWARDING_COUNT=$( sed -n -e 's/^\[managegwn-\([0-9]*\)\]$/\1/p' /etc/stunnel/vnc.conf | wc -l )
+	echo -e "\n  ${GOOD}*${NORMAL} ${BOLD}Standard ports:${NORMAL} ${FIRST_PORT} - $(( ${FIRST_PORT} + ${POOL_SIZE} - 1 ))"
+	if [ -z "${FIRST_SECURE_PORT}" ]; then
+		echo -e "  ${BAD}* No secure ports defined in Configuration.xml${NORMAL}\n    HTTPS will not work on this server."
+	else
+		echo -e "  ${GOOD}*${NORMAL} ${BOLD}Secure ports  :${NORMAL} ${FIRST_SECURE_PORT} - $(( ${FIRST_SECURE_PORT} + ${POOL_SIZE} - 1 ))"
+	fi
+	if [ ${MANAGEGWN_FORWARDING_COUNT} -gt 0 ]; then
+		TYPES="appserver managegwn"
+		if [ ${MANAGEGWN_FORWARDING_COUNT} -ne ${APPSERVER_FORWARDING_COUNT} ]; then
+			echo -en "  ${BAD}* Different number of port forwarding configurations for internal GWN cert (${APPSERVER_FORWARDING_COUNT}) and public cert (${MANAGEGWN_FORWARDING_COUNT})${NORMAL}"
+			BAD_CONFIG=true
+		else
+			echo -en "  ${GOOD}*${NORMAL} ${BOLD}# port forwarding definitions (in stunnel4):${NORMAL} ${APPSERVER_FORWARDING_COUNT}"
+		fi
+	elif [ ${APPSERVER_FORWARDING_COUNT} -eq 0 ]; then
+		TYPES=
+		die "  ${BAD}* no forwarding definitions found!${NORMAL}\n\nMost likely the SALT configuration for this server is incorrect.\n\nPlease contact DevOps to ensure that this server has the correct SALT configuration. Eventually, a Highstate is necessary.\n\nRerun this script after ensuring that this server is configured correctly." 4
+	else
+		TYPES="appserver"
+		echo -e "  ${GOOD}*${NORMAL} ${BOLD}# port forwarding definitions for internal GWN cert:${NORMAL} ${APPSERVER_FORWARDING_COUNT}"
+		echo -en "  ${WARN}*${NORMAL} ${BOLD}Note: no forwarding definitions for public cert!${NORMAL}"
+		NO_PUBLIC_CERTS=true
+	fi
+	NOW=$( date +%s )
+	for TYPE in ${TYPES}; do
+		case "${TYPE}" in
+			appserver)	SEC_TYPE="internal GWN"	;;
+			managegwn)	SEC_TYPE="public"	;;
+		esac
+		PREVIOUS_ACCEPT_IP=
+		ALL_PORTS_OK=true
+		for PORT in $( seq ${FIRST_PORT} $(( FIRST_PORT + POOL_SIZE - 1 )) ); do
+			ACCEPT_PORT=
+			ACCEPT_IP=
+			CONNECT_PORT=
+			CONNECT_IP=
+			eval $(
+				sed	-n \
+					-e "/\[${TYPE}-${PORT}\]/,/^$/{s/accept  *=  *\(.*\):\(.*\)/ACCEPT_IP='\1';ACCEPT_PORT='\2';/p;s/connect  *=  *\(.*\):\(.*\)/CONNECT_IP='\1';CONNECT_PORT='\2';/p}"	\
+					/etc/stunnel/vnc.conf
+			)
+			if [ -z "${ACCEPT_PORT}" ] || [ -z "${ACCEPT_IP}" ]; then
+				echo -en "\n    ${BAD}* no forwarding definition port ${PORT} found in vnc.conf${NORMAL}"
+				BAD_CONFIG=true
+				ALL_PORTS_OK=false
+			else
+				if [ -z "${PREVIOUS_ACCEPT_IP}" ]; then
+					echo -en "\n  ${GOOD}*${NORMAL} ${BOLD}Ports on ${ACCEPT_IP} (${SEC_TYPE} certificate):${NORMAL} "
+					PREVIOUS_ACCEPT_IP="${ACCEPT_IP}"
+				elif [ "${PREVIOUS_ACCEPT_IP}" != "${ACCEPT_IP}" ]; then
+					echo -en "\n    ${BAD}* not all IP addresses for the ${SEC_TYPE} ports are the same${NORMAL}"
+					ALL_PORTS_OK=false
+					BAD_CONFIG=true
+					break
+				fi
+				# See: http://www.shellhacks.com/en/HowTo-Decode-SSL-Certificate
+				CERT_FILE=$( mktemp -t vnc-openssl-check.XXXXXXXXXX )
+				openssl s_client -connect ${ACCEPT_IP}:${ACCEPT_PORT} -prexit > "${CERT_FILE}" 2>&1 < /dev/null
+				# Ok, cannot check the result here, because the forwarding connection
+				# cannot be established. So we know that the connection fails. However, we
+				# need to check if we could connect to the $ACCEPT_PORT and got certificate
+				# information.
+				if grep "^connect: Connection refused" "${CERT_FILE}" > /dev/null; then
+					echo -en "\n    ${BAD}* connection failed for port ${PORT}${NORMAL}"
+					CONNECTION_PROBLEM=true
+					ALL_PORTS_OK=false
+				else
+					VALID_START=
+					VALID_END=
+					SUBJECT=
+					eval $(
+						openssl x509 -in "${CERT_FILE}" -noout -subject -dates < /dev/null \
+							| sed	-n \
+								-e 's/^notBefore=\(.*\)$/VALID_START="\1";/p' \
+								-e 's/^notAfter=\(.*\)$/VALID_END="\1";/p' \
+								-e 's/^subject=.*CN=\([^\/]*\).*/SUBJECT="\1";/p'
+					)
+					VALID_START=$( date -d "${VALID_START}" "+%s" )
+					VALID_END=$(   date -d "${VALID_END}"   "+%s" )
+					if [ ${VALID_END} -lt ${NOW} ]; then
+						echo -en "\n    ${BAD}* certificate for port ${ACCEPT_PORT}  (${SEC_TYPE}) has expired on $( date -d @${VALID_END} "+%Y-%m-%d %H:%M" )${NORMAL}"
+						BAD_CERT=true
+						ALL_PORTS_OK=false
+					fi
+
+					# Get the cert that would be delivered on port 443 (instead of the $ACCEPT_PORT)
+					# but on the same $ACCEPT_IP and get the subject from that to check that we get the
+					# the same subject on the $ACCEPT_PORT.
+					# Since nginx does use Server Name Indication we need do pass in the $SUBJECT that we
+					# got from stunnel. Although the $SUBJECT is a wildcard nginx seems to accept the "*"
+					# as part of a server name.
+					WEB_CERT_FILE=$( mktemp -t vnc-openssl-check.XXXXXXXXXX )
+					openssl s_client -servername "${SUBJECT}" -connect ${ACCEPT_IP}:${ACCEPT_PORT} -prexit > "${WEB_CERT_FILE}" 2>&1 < /dev/null
+					WEB_SUBJECT=
+					eval $(
+						openssl x509 -in "${WEB_CERT_FILE}" -noout -subject -dates < /dev/null \
+							| sed	-n \
+								-e 's/^subject=.*CN=\([^\/]*\).*/WEB_SUBJECT="\1";/p'
+					)
+					if grep "^connect: Connection refused" "${WEB_CERT_FILE}" > /dev/null; then
+						echo -en "\n    ${WARN}* cannot check subject for ${PORT}${NORMAL} (is nginx running?)"
+					else
+						if [ "${SUBJECT}" != "${WEB_SUBJECT}" ]; then
+							echo -en "\n    ${BAD}* certificate for port ${ACCEPT_PORT} on ${ACCEPT_IP} (${SEC_TYPE}) has an invalid subject: \"${SUBJECT}\"${NORMAL}"
+							BAD_CERT=true
+							ALL_PORTS_OK=false
+						fi
+					fi
+					rm -f "${WEB_CERT_FILE}"
+				fi
+				rm -f "${CERT_FILE}"
+			fi
+		done
+		if ${ALL_PORTS_OK}; then
+			echo -en "${GOOD}ok.${NORMAL}"
+		fi
+	done
+	echo
+fi
+
+####################################################################################################
+# 7. Consistency check for stunnel vs Configuration.xml
+#    In the previous step we checked if we can connect to all ports in *Configuration.xml*. This
+#    checks if for every port in Configuration.xml there is a port in the stunnel configuration.
+#    The previous step, however, does *not* check if the mapping is consistent:
+#    E.g., if Configuration.xml declares 15 ports starting with 6905 but stunnel defines 20
+#    ports starting at 6900 this will *not* be detected by the previous step, although stunnel
+#    would map 6900:<public ip> to 6900:<internal ip> instead of 6905:<internal ip>
+STUNNEL_APPSERVER_PORT_COUNT=$( sed -n -e '/appserver-[1-9][0-9]*\]/p' /etc/stunnel/vnc.conf | wc -l )
+STUNNEL_MANAGEGWN_PORT_COUNT=$( sed -n -e '/managegwn-[1-9][0-9]*\]/p' /etc/stunnel/vnc.conf | wc -l )
+
+
+CHECK_SALT=false
+FAILED=false
+
+[ ${STUNNEL_APPSERVER_PORT_COUNT} -ne ${STUNNEL_MANAGEGWN_PORT_COUNT} ] \
+	&& echo -e "\n${BAD}* Inconsistent number of port definitions detected in \"stunnel4\" configuration${NORMAL}\n(appserver: ${STUNNEL_APPSERVER_PORT_COUNT}; managegwn: ${STUNNEL_MANAGEGWN_PORT_COUNT})" | ${FOLD} | sed -e '3,$s/^/  /' \
+	&& CHECK_SALT=true \
+	&& FAILED=true
+
+if [ -n "${POOL_SIZE}" ]; then
+	[ ${STUNNEL_APPSERVER_PORT_COUNT} -ne ${POOL_SIZE} ] \
+		&& echo -e "\n${BAD}* Inconsistent pool size detected in \"Configuration.xml\"${NORMAL}\n(stunnel4/appserver: ${STUNNEL_APPSERVER_PORT_COUNT}; stunnel4/managegwn: ${STUNNEL_MANAGEGWN_PORT_COUNT}; Configuration.xml: ${POOL_SIZE})\nMost likely \"Configuration.xml\" is wrong." | ${FOLD} | sed -e '3,$s/^/  /' \
+		&& FAILED=true
+fi
+
+${BAD_CERT} \
+	&& echo -e "\n${BAD}* Invalid or out of date certificate detected.${NORMAL}" | ${FOLD} | sed -e '3,$s/^/  /' \
+	&& CHECK_SALT=true \
+	&& FAILED=true
+
+${BAD_CONFIG} \
+	&& echo -e "\n${BAD}* Inconsistent \"stunnel4\" configuration detected.${NORMAL}" | ${FOLD} | sed -e '3,$s/^/  /' \
+	&& CHECK_SALT=true \
+	&& FAILED=true
+
+
+${CONNECTION_PROBLEM} \
+	&& echo -e "\n${BAD}* Connection problem detected.${NORMAL}\n\nThis could indicate a problem with the firewall configuration or a problem with the \"stunnel4\" configuration." | ${FOLD} | sed -e '3,$s/^/  /' \
+	&& CHECK_SALT=true \
+	&& FAILED=true
+
+${NO_PUBLIC_CERTS} \
+	&& echo -e "\n${WARN}*${NORMAL} ${BOLD}Note that this server cannot be used outside of the GetWellNetwork, Inc. network since no public certificates seem to be installed/defined.${NORMAL}" | ${FOLD} | sed -e '3,$s/^/  /'
+
+
+${CHECK_SALT} \
+	&& echo -e "\nMost likely the SALT configuration for this server is incorrect.\n\nPlease contact DevOps to ensure that this server has the correct SALT configuration. Eventually, a Highstate is necessary.\n\nRerun this script after ensuring that this server is configured correctly."
+
+${FAILED} \
+	&& exit 5

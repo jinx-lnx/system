@@ -1,0 +1,114 @@
+#!/bin/bash -u
+#
+# Checks whether the given node spec applies to this host.
+#
+# Prints the hostname(s) that would apply to the node spec.
+#
+# Exit codes:
+#   0 - run: correct node
+#   1 - do not run: not the correct node
+#   2 - errors in parameter processing
+#   3 - invalid node spec
+#   4 - need to be root (forgot to call via sudo?)
+#   5 - error while talking to the cluster software
+
+
+
+SCRIPT_PATH="$( readlink -f "${BASH_SOURCE[0]}" )"
+BASE_DIR="$( dirname "${SCRIPT_PATH}" )"
+if [ ! -f "${BASE_DIR}/functions.sh" ]; then echo "'functions.sh' not found" ; exit 1; fi
+. "${BASE_DIR}/functions.sh"
+
+[ $( id -u ) -eq 0 ] || die "${BAD}Need to be root${NORMAL}" 4
+
+[ ${#} -gt 0 ] || die "${BAD}No arguments given${NORMAL}. Please provide the type of node that this script should run on" 2
+
+NODE="${1}" ; shift
+
+WAIT_FOR_CLUSTER=false
+if [ ${#} -gt 0 ]; then
+	if [ "${1}" = "-w" ]; then
+		WAIT_FOR_CLUSTER=true
+		shift
+	fi
+fi
+
+[ ${#} -gt 0 ] && die "${BAD}No arguments given${NORMAL}" 2
+
+if ${WAIT_FOR_CLUSTER}; then
+	checkClusterStatus
+	CLUSTER_RESULT=${?}
+	# Just catch the cases where we need to wait (2 or 3), let
+	# all the other codes fall through for later processing.
+	case ${CLUSTER_RESULT} in
+		2|3) # Up and running WITHOUT DC: need to wait for cluster (2), or
+		   # Not running yet (3) => need to wait for it
+			waitForCluster "" "" 300
+			CLUSTER_RESULT=${?} # Override the previous result
+			if [ ${CLUSTER_RESULT} -eq 0 ]; then
+				# Since we had to wait for the cluster individual
+				# resources may still be starting up. Depending
+				# on the node type we may need to sleep some more time.
+				case "${NODE}" in
+					master)
+						sleep 20
+						;;
+					slave)
+						sleep 40
+						;;
+					jboss)
+						sleep 60
+						;;
+					appserver)
+						sleep 10
+						;;
+				esac
+			# else: do nothing here, let the next case handle the error checking
+			fi
+			;;
+	esac
+	case ${CLUSTER_RESULT} in
+		0) # Up and running with DC *and* resources. Everything ok, continue
+			;;
+		1) # Up and running with DC but without resources
+			die "${BAD}Cluster does not have any resources defined${NORMAL}.\n" 5
+			;;
+		#2) # Up and running WITHOUT DC: Can't happen ("waitForCluster" waits for it)
+		#3) # Not running yet: Can't happen ("waitForCluster" waits for it)
+		4) # Could not extract DC
+			die "${BAD}Could not extract current DC from \"${CRM} status\"${NORMAL}.\n\ncrm status output:\n${CIB_STATUS}" 5
+			;;
+		5) # Could not extract resource count
+			die "${BAD}Could not extract resource count from \"crm status\"${NORMAL}.\n\ncrm status output:\n${CIB_STATUS}" 5
+			;;
+		6) # Cluster software not started
+			die "${BAD}The cluster software is not running!${NORMAL}" 5
+			;;
+		7) # Cluster software was started but disappeared
+			die "${BAD}The cluster software was running but disappeared!${NORMAL}" 5
+			;;
+	esac
+fi
+
+case "${NODE}" in
+	master) # Node that has the DB master
+		locateDbMaster
+		[ ${?} -eq 1 ] || exit 1
+		;;
+	slave) # Any node that has a running and working DB slave
+		locateDbSlaves
+		[ ${?} -eq 1 ] || exit 1
+		;;
+	jboss) # Any node where JBoss is *running*
+		locateJBoss
+		[ ${?} -eq 1 ] || exit 1
+		;;
+	appserver) # Node that has the AppserverIP resource
+		locateAppserverIp
+		[ ${?} -eq 1 ] || exit 1
+		;;
+	*)
+		die "Invalid node spec \"${NODE}\"" 3
+		;;
+esac
+exit 0

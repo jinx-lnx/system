@@ -1,0 +1,153 @@
+#!/bin/bash -u
+
+# This script wakes up every hour, calculates whether it needs to run
+# an automatic Salt highstate, checks if Salt is allowing auto-updates
+# and executes the highstate if all criteria are met.
+#
+
+# First, check if it's even our turn _right now_ (based on the hash of our host name)
+if [ ! -x /opt/gwn/python/timeslot-hasher.py ] ; then
+  # The checker script is missing, bailing out
+  exit
+fi
+
+/opt/gwn/python/timeslot-hasher.py --tag HIGHSTATE --weekdays mon tue wed thu fri \
+    --hours 0 1 2 3 4 5 6 7 --quiet
+if [ $? -eq 0 ] ; then
+  # Random sleep for a few seconds to spread the cron-driven requests across sites
+  case "${TERM:-}" in
+    dumb|unknown)
+      sleep $(eval "expr ${RANDOM} % 300")
+      ;;
+  esac
+
+  LOG="/usr/bin/logger -t auto-highstate"
+
+  # It is my turn to run! Fetch the whole auto_highstate global config as YAML
+  AUTO_CONFIG=$(/usr/bin/salt-call --log-level=error --output=yaml pillar.get gwn-global:auto_highstate)
+
+  # Check the global 'enabled' flag first
+  echo "${AUTO_CONFIG}" | grep -qiE '^  enabled:.*true$'
+  if [ $? -eq 0 ] ; then
+    ${LOG} "Auto-highstate globally enabled."
+
+    # Does our hostname match the exclude regex? Note: ALL spaces are trimmed!
+    EXCLUDE_REGEX=$(echo "${AUTO_CONFIG}" | grep 'hostname_regex_exclude:' | cut -d ':' -f 2 | sed -e 's/^[ ]\+//')
+    if [ "${EXCLUDE_REGEX}" != "''" ] ; then
+      hostname -f | grep -qE "${EXCLUDE_REGEX}"
+      if [ $? -eq 0 ] ; then
+        ${LOG} "My hostname matched the exclude pattern. SKIPPING."
+        exit 0
+      fi
+    fi
+
+    # Does our hostname match the include regex? Note: ALL spaces are trimmed!
+    INCLUDE_REGEX=$(echo "${AUTO_CONFIG}" | grep 'hostname_regex_include:' | cut -d ':' -f 2 | sed -e 's/^[ ]\+//')
+    if [ "${INCLUDE_REGEX}" == "''" ] ; then
+      ${LOG} "No include regex defined. SKIPPING."
+      exit 0
+    else
+      hostname -f | grep -qE "${INCLUDE_REGEX}"
+      if [ $? -eq 0 ] ; then
+
+        # All criteria met. Let's highstate now!
+        # --------------------------------------
+
+        # Do we support the new 'state-output' option?
+        salt-call --help | grep -q "state-output="
+        if [ $? -eq 0 ] ; then
+            OUTOPT="--state-output=changes"
+        else
+            OUTOPT=""
+        fi
+
+        # Phase 1: Let's do this!
+        ${LOG} "All criteria met. EXECUTING HIGHSTATE."
+        ERRORS=/opt/tmp/auto-highstate-$(date +"%F").err
+        /usr/bin/salt-call --log-level=error --no-color ${OUTOPT} state.highstate \
+            2> ${ERRORS} > /opt/tmp/auto-highstate-$(date +"%F").log
+        ${LOG} "Auto-highstate complete."
+
+        # If there were errors, email them to the admins
+        if [ -s ${ERRORS} ] ; then
+          cat ${ERRORS} | /opt/gwn/python/servermail.py -s "auto-highstate status"
+        else
+          # Remove empty file (if it exists)
+          test -f ${ERRORS} && rm ${ERRORS}
+        fi
+
+        # Phase 2: run a full OS upgrade if the following criteria are met:
+        #          1. server has more than 60 MB disk space available in /boot (for Kernels)
+        #          2. this server does not have FDE
+        #          3. auto_os_updates are enabled in server_features
+
+        # 1. Ensure disk space is available
+        BOOT_SPACE=$(df --output=avail /boot | tail -n1)
+        if [ ${BOOT_SPACE} -lt 61440 ] ; then
+          ${LOG} "Not enough disk space in /boot (${BOOT_SPACE} KB) to consider auto OS upgrades. Aborting."
+          exit 0
+        else
+          ${LOG} "Sufficient disk space in /boot. Proceeding."
+        fi
+
+        # 2. If the server uses full disk encryption, no auto OS upgrades (for now)
+        if [ -e '/etc/crypttab' -a -e '/dev/mapper/crypt-root' ] ; then
+          ${LOG} "Server uses full disk encryption. Auto OS upgrades not supported (yet). Aborting."
+          exit 0
+        else
+          ${LOG} "Not using full disk encryption. Proceeding."
+        fi
+
+        # 3. Auto OS upgrades enabled in server_features?
+        OS_UPGRADE=$(/usr/bin/salt-call --log-level=error --output=yaml gwn.getval 'server_features:auto_os_updates' false)
+        echo "${OS_UPGRADE}" | grep -qiE '^local: true$'
+        if [ $? -eq 0 ] ; then
+            ${LOG} "Auto-OS-upgrade enabled on this host and no FDE detected. Proceeding with auto-OS-upgrade."
+            APT=$(which apt-get)
+            if [ -z "${APT}" -o ! -x "${APT}" ] ; then
+              ${LOG} "No apt or apt-get found. Aborting."
+              exit 0
+            fi
+            # Capture the output
+            OS_LOG=/opt/tmp/auto-os-upgrade-$(date +"%F").log
+            DO_REBOOT=No
+            echo -e "===== apt-get update (showing errors only): =====\n" > ${OS_LOG}
+            ${APT} --quiet update >/dev/null 2>> ${OS_LOG}
+            if [ $? -eq 0 ] ; then
+              echo -e "\n\n===== apt-get upgrade: =====\n" >> ${OS_LOG}
+              DEBIAN_FRONTEND=noninteractive ${APT} --yes upgrade >> ${OS_LOG} 2>&1
+              if [ $? -eq 0 ] ; then
+                DO_REBOOT=Yes
+                echo -e "\n\n===== apt-get autoremove: =====\n" >> ${OS_LOG}
+                DEBIAN_FRONTEND=noninteractive ${APT} --yes autoremove >> ${OS_LOG} 2>&1
+                echo -e "\n\n==== Upgrade completed. Will trigger a reboot now. =====" >> ${OS_LOG}
+              else
+                echo -e "\n==== ${APT} dist-upgrade failed. Aborted. =====" >> ${OS_LOG}
+              fi
+            else
+              echo -e "\n==== ${APT} update failed. Aborted. =====" >> ${OS_LOG}
+            fi
+
+            # Send out the report to Bernd (for now)
+            #cat ${OS_LOG} | mail -s "Auto-OS-upgrade on $(hostname -f)" bnigmann@getwellnetwork.com
+            #sleep 5
+            if [ "${DO_REBOOT}" == "Yes" ] ; then
+              ${LOG} "Triggering a system reboot after successful completion of auto-highstate and auto-os-upgrade."
+              sync
+              /sbin/reboot
+            fi
+        fi
+
+      else
+        ${LOG} "My hostname does not match the include regex. SKIPPING."
+        exit 0
+      fi
+    fi
+
+
+  else
+    # Globally disabled. Bail out.
+    ${LOG} "Auto-highstate globally DISABLED."
+    exit 0
+  fi
+fi

@@ -1,0 +1,345 @@
+#!/bin/bash -u
+
+function findFile() {
+	for FILE in "${@}"; do
+		if [ -f "${FILE}" ]; then
+			echo -n "${FILE}"
+			return 0
+		fi
+	done
+	return 1
+}
+
+function checkFiles() {
+	local MAX_SZ=${1}       ; shift
+	local BACKUP_LOC="${1}" ; shift
+	local RESULT=0
+	local SZ=
+	local COMPRESSOR=gzip
+	#local COMPRESSOR=cat
+	#local COMPRESSOR=bzip2
+	#local COMPRESSOR=XZ
+	local COMPRESSOR_SUFFIX=
+	case "${COMPRESSOR}" in
+		cat)   COMPRESSOR_SUFFIX=     ;;
+		gzip)  COMPRESSOR_SUFFIX=.gz  ;;
+		bzip2) COMPRESSOR_SUFFIX=.bz2 ;;
+		xz)    COMPRESSOR_SUFFIX=.xz  ;;
+	esac
+
+	for FILE in "${@}"; do
+		if [ -f "${FILE}" ]; then
+			FILE=$( readlink -f "${FILE}" )
+			FILENAME=$( basename "${FILE}" )
+
+			BACKUP_FILE="${BACKUP_LOC}/${FILENAME}_${TIMESTAMP}${COMPRESSOR_SUFFIX}"
+			SZ=$( stat -c '%s' "${FILE}" )
+			if [ ${SZ} -gt ${MAX_SZ} ]; then
+				echo -e "\n${GOOD}*${NORMAL} ${BOLD}Backing up (and truncating) \"${FILE}\" ($( prettyPrintSize ${SZ} )) to \"${BACKUP_FILE}\"...${NORMAL}"
+				REPORT="${REPORT}
+
+* Backed up (and truncated) \"${FILE}\" ($( prettyPrintSize ${SZ} )) to \"${BACKUP_FILE}\""
+				touch "${BACKUP_FILE}"
+				chmod 600 "${BACKUP_FILE}"
+				chown root:root "${BACKUP_FILE}"
+				pv "${FILE}" | ${COMPRESSOR} - > "${BACKUP_FILE}"
+				cat /dev/null > "${FILE}"
+				RESULT=1
+			fi
+		fi
+	done
+	return ${RESULT}
+}
+
+function sendMail() {
+	local RECIPIENT="${1}" ; shift
+	local SUBJECT="${1}"   ; shift
+
+	local FACILITY_CODE=
+
+	FACILITY_CODE="$(
+		if [ -f /etc/FacilityCode.txt ]; then
+			cat /etc/FacilityCode.txt
+		elif [ -f /etc/gwn/server.conf ]; then
+			sed	-n \
+				-e 's/\s*facility_code: //p' \
+				/etc/gwn/server.conf
+		else
+			hostname -f
+		fi
+
+	)"
+	mail	-a "From: \"${FACILITY_CODE} Appserver\" <root@$(hostname -f)>" \
+		-s "${FACILITY_CODE}: ${SUBJECT}" \
+		"${RECIPIENT}"
+}
+
+function prettyPrintSize() {
+	local SZ="${1}" ; shift
+
+	if [ ${SZ} -lt 1024 ]; then
+		echo -n "${SZ}"
+	else
+		SZ=$(( SZ / 1024 ))
+		if [ ${SZ} -lt 1024 ]; then
+			echo -n "${SZ}K"
+		else
+			SZ=$(( SZ / 1024 ))
+			if [ ${SZ} -lt 1024 ]; then
+				echo -n "${SZ}M"
+			else
+				SZ=$(( SZ / 1024 ))
+				echo -n "${SZ}G"
+			fi
+		fi
+	fi
+}
+
+function getFreeSpace() {
+	local MOUNT_POINT="${1}" ; shift
+	echo -n $(( $( df / | tail -n 1 | awk '{print $4;}' ) * 1024 ))
+}
+
+function restartNginx() {
+	local COUNT
+	service nginx stop
+	COUNT=0
+	while [ ! -z "$( pidof nginx )" ]; do
+		sleep .5
+		(( COUNT++ ))
+		[ ${COUNT} -gt 20 ] && return 2
+	done
+	service nginx start
+	COUNT=0
+	while [ -z "$( pidof nginx )" ]; do
+		sleep .5
+		(( COUNT++ ))
+		[ ${COUNT} -gt 20 ] && return 3
+	done
+	return 0
+}
+
+function findExe {
+        local COMMAND="${1}"; shift
+        local FOUND_PATH=
+
+        FOUND_PATH=
+        while [ ${#} -gt 0 ]; do
+                if [ -x "${1}/${COMMAND}" ]; then
+                        FOUND_PATH="${1}/${COMMAND}"
+                        break
+                fi
+                shift
+        done
+        [ -z "${FOUND_PATH}" ] && FOUND_PATH="$( which "${COMMAND}" 2> /dev/null )"
+        [ -z "${FOUND_PATH}" ] && return 0
+        readlink -f "${FOUND_PATH}"
+}
+
+
+function cleanup() {
+	IFS="${oIFS}"
+	FREE_SPACE_FINAL=$( getFreeSpace / )
+	REPORT="${REPORT}
+
+User cancelled operation.
+
+Free space after cleaning up: $( prettyPrintSize ${FREE_SPACE_FINAL} )"
+	echo -e "${REPORT}" | sendMail "root" "reclaim-space results"
+	exit 1
+}
+
+if [ -z "${USECOLOR:-}" ]; then
+	case "${TERM:-}" in
+		xterm*|rxvt)
+		USECOLOR="yes"
+		;;
+	linux) # Console says this
+		USECOLOR="yes"
+		;;
+	screen)
+		USECOLOR="yes"
+		;;
+	*)
+		USECOLOR="no"
+		;;
+	esac
+fi
+if [[ "${USECOLOR}" == "yes" ]]; then
+	BOLD="\033[1m"
+	GOOD="\e[32;01m"
+	WARN="\e[33;01m"
+	BAD="\e[31;01m"
+	HILITE="\e[36;01m"
+	BRACKET="\e[34;01m"
+	# If we run bash with "-x" it will log all the color assignemts
+	# which actually sets the colors and whatnot.
+	# Keep "NORMAL" at the end to reset all the effects!
+	NORMAL="\033[0m$( tput sgr0 )"
+else
+	BOLD=""
+	GOOD=""
+	WARN=""
+	BAD=""
+	HILITE=""
+	BRACKET=""
+	NORMAL=""
+fi
+
+CRM="$( findExe crm /bin /usr/bin /sbin /usr/sbin )"
+
+TIMESTAMP=$( date +%Y%m%d-%H%M%S )
+NGINX_PID_FILE=/run/nginx.pid
+[ -z "${MAX_HOME_SIZE:-}" ] && MAX_HOME_SIZE=$(( 1 * 1024 * 1024 * 1024 )) # 1Gb
+[ -z "${MAX_LOG_SIZE:-}"  ] && MAX_LOG_SIZE=$((  1 * 1024 * 1024 * 1024 )) # 1Gb
+[ -z "${MAX_TMP_SIZE:-}"  ] && MAX_TMP_SIZE=$((  1 * 1024 * 1024 * 1024 )) # 1Gb
+[ -z "${MIN_FREE_SIZE:-}"  ] && MIN_FREE_SIZE=$((  1 * 1024 * 1024 * 1024 )) # 1Gb
+BACKUP_LOCATION=/opt/tmp
+
+oIFS="${IFS}"
+trap cleanup TERM KILL INT
+
+if [ $( id -u ) -ne 0 ]; then
+	echo -e "${BOLD}This script requires 'root' privileges. You probably want to use sudo${NORMAL}"
+	exit 2
+fi
+
+if [ -z "${FULLUSERNAME:-}" ]; then
+	if [ -z "${SUDO_USER:-}" ]; then
+		FULLUSERNAME=$( whoami )
+	else
+		FULLUSERNAME="${SUDO_USER}"
+	fi
+	FULLUSERNAME=$( getent passwd "${FULLUSERNAME}" |cut -d: -f5 )
+fi
+
+
+REPORT="${0} run by ${FULLUSERNAME} on $( date +"%m/%d/%Y @ %H:%M:%S" )"
+
+FREE_SPACE_INITIAL=$( getFreeSpace / )
+REPORT="${REPORT}
+
+Free space before cleaning up: $( prettyPrintSize ${FREE_SPACE_INITIAL} )"
+
+
+if [ ${FREE_SPACE_INITIAL} -gt ${MIN_FREE_SIZE} ]; then
+	echo -e "${BOLD}This server seems to have enough free space ($(prettyPrintSize ${FREE_SPACE_INITIAL}))"
+	REPORT="${REPORT}
+
+No action taken since server has enough free space."
+else
+	echo -e "\n${BOLD}Free space before cleaning up:${NORMAL} $( prettyPrintSize ${FREE_SPACE_INITIAL} )"
+
+	if ! checkFiles \
+		${MAX_LOG_SIZE} \
+		"${BACKUP_LOCATION}" \
+		/var/log/nginx/error.log \
+		/var/log/nginx/access.log
+	then
+		if [ -f "${NGINX_PID_FILE}" ]; then
+			echo -e "\n${GOOD}*${NORMAL} ${BOLD}Restarting Nginx...${NORMAL}"
+			restartNginx 
+			case ${?} in
+				0)
+					REPORT="${REPORT}
+
+* Restarted Nginx"
+					;;
+				1)
+					if [ -f "${NGINX_PID_FILE}" ]; then
+						NGINX_PID=$( "${NGINX_PID_FILE}" )
+						kill ${NGINX_PID}
+						REPORT="${REPORT}
+
+* Could not restart Nginx (unknown system configuration?).
+  Process ${NGINX_PID} was sent the TERM signal."
+						echo -e "\n${BAD}*${NORMAL} ${BOLD}No known method available for restarting Nginx.${NORMAL}\nThe process ${NGINX_PID} was terminated but please check and restart Nginx manually!"
+					else
+						REPORT="${REPORT}
+
+* Could not restart Nginx (unknown system configuration?).
+  No running process of Nginx was found."
+						echo -e "\n${BAD}*${NORMAL} ${BOLD}No known method available for restarting Nginx.${NORMAL}\nNo running process of Nginx was found"
+					fi
+					;;
+				2)
+					REPORT="${REPORT}
+
+* Could not stop Nginx (did not terminate in time).
+  No running process of Nginx was found."
+					echo -e "\n${BAD}*${NORMAL} ${BOLD}Could not stop Nginx.${NORMAL} Please restart Nginx manually!"
+					;;
+				3)
+					REPORT="${REPORT}
+
+* Could not start Nginx (did not start in time)."
+					echo -e "\n${BAD}*${NORMAL} ${BOLD}Could not start Nginx.${NORMAL} Please restart Nginx manually!"
+					;;
+			esac
+					REPORT="${REPORT}
+  Nginx processes:
+$( ps xauw | sed -n -e 's/^/  /' -e 1p -e /[n]ginx:/p )"
+		fi
+	fi
+
+	IFS=$'\n'
+	for DIR in /tmp /var/tmp; do
+		for FILE in $( find "${DIR}" -type f -size "+${MAX_TMP_SIZE}c" ); do
+			SZ=$( stat -c '%s' "${FILE}" )
+			FILE=$( readlink -f "${FILE}" )
+			FILENAME=$( basename "${FILE}" )
+			BACKUP_FILE="${BACKUP_LOCATION}/${FILENAME}_${TIMESTAMP}"
+			echo -e "\n${GOOD}*${NORMAL} ${BOLD}Moving \"${FILE}\" ($( prettyPrintSize ${SZ} )) to \"${BACKUP_FILE}\"...${NORMAL}"
+			REPORT="${REPORT}
+
+* Moved \"${FILE}\" ($( prettyPrintSize ${SZ} )) to \"${BACKUP_FILE}\"
+"
+			mv "${FILE}" "${BACKUP_FILE}"
+			chmod 600 "${BACKUP_FILE}"
+			touch "${BACKUP_FILE}"
+			chown root:root "${BACKUP_FILE}"
+		done
+	done
+	IFS="${oIFS}"
+
+	for DIR in /root /home/*; do
+		SZ=$(( $( du -s "${DIR}" | cut -d$'\t'  -f1 ) * 1024 ))
+		if [ ${SZ} -gt ${MAX_HOME_SIZE} ]; then
+			case "${DIR}" in
+				/root)
+					EMAIL_RECIPIENT=root
+					EMAIL_USER="System Administrator"
+					;;
+				/home/admin)
+					EMAIL_RECIPIENT=root
+					EMAIL_USER="System Administrator"
+					;;
+				/home/reporter)
+					EMAIL_RECIPIENT=root
+					EMAIL_USER="System Administrator"
+					;;
+				*)
+					EMAIL_RECIPIENT="${DIR#/home/}@getwellnetwork.com"
+					EMAIL_USER=$( getent passwd "${EMAIL_RECIPIENT%@*}" |cut -d: -f5 )
+					;;
+			esac
+			echo -e "\n${BAD}*${NORMAL}${BOLD} \"${DIR}\" too large: ($( prettyPrintSize ${SZ} )), sending mail to \"${EMAIL_RECIPIENT}\"...${NORMAL}"
+			REPORT="${REPORT}
+
+* \"${DIR}\" too large: $( prettyPrintSize ${SZ} ), sent mail to \"${EMAIL_RECIPIENT}\""
+			echo -en "Dear ${EMAIL_USER},\n\nYour home directory\n     ${DIR} ($( prettyPrintSize ${SZ} ))\nis too large and this server is filling up. Please remove some of your files ASAP." \
+			| sendMail "${EMAIL_RECIPIENT}" "Home Directory Too Large"
+		fi
+	done
+
+	FREE_SPACE_FINAL=$( getFreeSpace / )
+	FREED_SPACE=$(( ${FREE_SPACE_INITIAL} - ${FREE_SPACE_FINAL} ))
+	echo -e "\n${BOLD}Free space after cleaning up:${NORMAL} $( prettyPrintSize ${FREE_SPACE_FINAL} )\n\n${WARN}Note:${NORMAL} ${BOLD}Files in /opt/tmp/ will be removed within 7 deys!${NORMAL}"
+	REPORT="${REPORT}
+
+Free space after cleaning up: $( prettyPrintSize ${FREE_SPACE_FINAL} )
+
+NOTE: Files in /opt/tmp WILL be removed within 7 days!"
+fi
+
+echo -e "${REPORT}" | sendMail "root" "reclaim-space results"

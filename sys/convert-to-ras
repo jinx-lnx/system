@@ -1,0 +1,191 @@
+#!/bin/bash -u
+
+
+
+
+
+
+################################################################################
+#
+# Functions
+
+function cleanup() {
+	if [ $( pidof heartbeat | wc -w ) -gt 0 ]; then
+		# Something *did* start heartbeat.
+		# Since we want to be able to re-run this script and since the
+		# script does check if there is a heartbeat process is running
+		# we better shut it down here.
+		service  heartbeat stop
+	fi
+
+}
+
+################################################################################
+#
+# Set up variables
+
+NEW_HOSTNAME="${NEW_HOSTNAME:-ras1}"
+
+
+
+################################################################################
+#
+# Set up internal variables and pull in our standard functions/vars
+
+BASE_DIR="$( dirname "$( readlink -f "${BASH_SOURCE[0]}" )" )"
+if [ ! -f "${BASE_DIR}/functions.sh" ]; then echo "'functions.sh' not found" ; exit 1; fi
+. "${BASE_DIR}/functions.sh"
+
+MYSQL="$( findExe mysql /bin /usr/bin /usr/local/mysql/bin )"
+MYSQLD="$( findExe mysqld /usr/libexec /usr/sbin /usr/bin )"
+MYSQLDUMP="$( findExe mysqldump /bin /usr/bin /usr/local/mysql/bin )"
+MYSQL_OPTS="${MYSQL_OPTS:-}"
+
+CURRENT_IP=$( getCurrentIp )
+
+
+
+################################################################################
+#
+# Preflight Check
+
+[ $( pidof heartbeat | wc -w ) -eq 0 ] \
+	|| die "\n${BAD}Heartbeat is running${NORMAL}. It seems the conversion to RAS 2.0 has already started.\n\nYou probably want to finish this conversion by running\n    ${BOLD}finish-ras-conversion${NORMAL}\nPlease see the GetSmart documentation \"${BOLD}${GOOD}How To Convert An Existing Appserver Into RAS 2.0${NORMAL}\" for details." 1
+
+# Check if SALT is configured properly. We check the pillar data if it contains
+# "ras_system:true". If that's not present (or not true) then we know that
+# soooooomebody forgot to reconfigure SALT and we can't run
+IS_RAS_SYSTEM=$(
+	salt-call --out=yaml pillar.data \
+	| sed -ne 's/[ \t]*ras_system:[ \t]*//p'
+)
+[ "${IS_RAS_SYSTEM}" = "true" ] \
+	|| die "\n${BAD}This system is not configured as RAS${NORMAL} ${BOLD}in Salt.${NORMAL}\n\nPlease check the Salt configuration and try again" 2
+
+
+################################################################################
+#
+# Parameter processing
+
+[ ${#} -le 1 ] || die "Too many parameters" 1
+if [ ${#} -eq 0 ]; then
+	case "${CURRENT_IP}" in
+		*\.10)
+			RAS1_IP="${CURRENT_IP%.10}.14"
+			;;
+		*)
+			die "${BAD}Could not determine the future IP address for ${BOLD}ras1${NORMAL}.\n\nYou need to specify the IP address for ${BOLD}ras1${NORMAL}.\n\nPlease see the GetSmart documentation \"${BOLD}${GOOD}How To Convert An Existing Appserver Into RAS 2.0${NORMAL}\" for details." 2
+			;;
+	esac
+else
+	RAS1_IP="${1}"
+fi
+
+
+
+################################################################################
+#
+# Report what's gonna happen and confirmation
+
+echo -e "${BOLD}================================================================================${NORMAL}"
+echo -e "${BOLD}                             Conversion to RAS 2.0                              ${NORMAL}"
+echo -e "${BOLD}================================================================================${NORMAL}"
+
+echo -e "\nBy continuing this server will be converted into a single node RAS 2.0 cluster.\n\nThe process will shut down and interrupt PLS services." \
+	| ${FOLD}
+[ "${CURRENT_IP}" = "${RAS1_IP}" ] \
+	|| echo -e "\n\nThe conversion should change the unique IP address of this server from ${HILITE}${CURRENT_IP}${NORMAL} to ${GOOD}${RAS1_IP}${NORMAL}."
+
+askYesNo "\nDo you want to continue?" || exit 0
+
+
+
+################################################################################
+#
+# Main script starts here!
+
+trap cleanup EXIT
+
+echo -e "\n${GOOD}*${NORMAL} ${BOLD}Updating configuration...\n"
+# Shut down the Salt Minion
+service salt-minion stop 2> /dev/null
+
+# Update Salt Minion ID and the grain definition:
+sed	\
+	-e "s/^\([ \t]*id:[ \t]*\)appserver\./\1${NEW_HOSTNAME}./" \
+	/etc/salt/minion \
+	-i
+sed	\
+	-e "s/^\([ \t]*full_host_name:[ \t]*\)appserver\./\1${NEW_HOSTNAME}./" \
+	-e "s/^\([ \t]*ip_address:[ \t]*\)${CURRENT_IP}/\1${RAS1_IP}/" \
+	/etc/gwn/server.conf \
+	-i
+
+
+# Get new ID
+SALT_ID=$(
+	sed -ne 's/^[ \t]*id:[ \t]*//p' /etc/salt/minion
+)
+
+SUMMARY=$( salt-call state.highstate )
+dieIfError "\n${SUMMARY}\n\n${BAD}Could not update configuration from Salt Master${NORMAL}.\n\nPlease make sure that the Salt configuration has been changed according to the GetSmart documentation \"${BOLD}${GOOD}How To Convert An Existing Appserver Into RAS 2.0${NORMAL}\".\n\nMost likely, the Salt Master now has a request pending for a host with the ID \"${BOLD}${SALT_ID}${NORMAL}\", which needs to be cleaned up."
+
+echo
+echo "${SUMMARY}"
+
+# Interpret the output. It is possible that the salt call itself
+# succeeds but part of what Salt tried to do failed or couldn't
+# be done. This does NOT affect the exit code of salt-call but
+# is rather printed in the summary to STDOUT.
+SUCCEEDED=
+FAILED=
+TOTAL=
+eval $(
+	echo -e "${SUMMARY}" \
+		| sed   -n \
+			-e '/^Summary for local$/,$s/^\([a-zA-Z][a-zA-Z]*\): *\([0-9][0-9]*\).*/\1=\2/p' \
+		| tr [a-z] [A-Z]
+)
+[ ${FAILED} -eq 0 ] \
+	|| die "\n${BAD}One or more configuration changes failed to apply${NORMAL}.\nPlease check the output above, fix the problem and try again.\n" 1
+
+
+service gwn-jboss stop 2>/dev/null
+service mysql stop     2>/dev/null
+startUnsecuredLocalMySql
+dieIfError "${BAD}Could not start local MySQL daemon${NORMAL} ${BOLD}to initialize replication permissions${NORMAL}."
+
+echo -e "\n${GOOD}*${NORMAL} ${BOLD}Setting up permissions for replication...\n"
+"${MYSQL}" ${MYSQL_OPTS} < /opt/gwn/init-database.sql
+RC=${?}
+
+# Stop unsecured MySQL daemon
+kill ${MYSQLD_PID}
+
+[ ${RC} -eq 0 ] \
+	|| die "${BAD}Could not initialize replication permissions.${NORMAL}" 4
+
+echo -e "\n${GOOD}*${NORMAL} ${BOLD}Reconfiguring main IP address to be \"${GOOD}${RAS1_IP}${NORMAL}\"...\n"
+sed	\
+	-e "/allow-hotplug eth0/,/^$/s/\([ \t]*address \)${CURRENT_IP}$/\1${RAS1_IP}/" \
+	/etc/network/interfaces \
+	-i
+
+
+echo -e "\n${GOOD}********************************************************************************${NORMAL}"
+echo -e "${BOLD}                    RAS 2.0 Conversion First Phase Completed                    ${NORMAL}"
+echo -e "${GOOD}********************************************************************************${NORMAL}"
+echo -e "\nThis server will now reboot. After it rebooted it should be reachable via the IP address ${GOOD}${RAS1_IP}${NORMAL}." \
+	| ${FOLD}
+echo -e "\nPlease log in again and finish the installation by running\n    ${BOLD}finish-ras-conversion${NORMAL}\n"
+
+echo -e "Press <${HILITE}Enter${NORMAL}> to reboot.\n"
+
+read
+
+shutdown -r now
+
+# This doesn't seem to work:
+#sleep .5
+#[ $( readlink -f /proc/${PPID}/exe ) = "/bin/bash" ] \
+#	&& kill ${PPID} # Log us out

@@ -1,0 +1,908 @@
+#!/bin/bash -u
+
+function die() {
+  echo -e "${1}"
+  exit ${2}
+}
+
+function waitForWildflyUp() {
+  isJBossRunning && return
+  local WAIT_TIME=${1} ; shift
+  echo -en "\n ${GOOD}*${NORMAL} ${BOLD}Waiting for Wildfly to start${NORMAL}"
+  for COUNT in $( seq 1 ${WAIT_TIME} ); do
+    if isJBossRunning; then
+      echo
+      return 0
+    fi
+    sleep 1
+    echo -en "${BOLD}.${NORMAL}"
+  done
+  echo -e " ${BAD}failed${NORMAL}"
+  return 1
+}
+
+function waitForDebugLog() {
+  [ -f "${WILDFLY_DIR}/standalone/log/debug.log" ] && return
+  local WAIT_TIME=${1} ; shift
+  echo -en "\n ${GOOD}*${NORMAL} ${BOLD}Waiting for debug log file to appear${NORMAL}"
+  for COUNT in $( seq 1 ${WAIT_TIME} ); do
+    if [ -f "${WILDFLY_DIR}/standalone/log/debug.log" ]; then
+      echo
+      return 0
+    fi
+    sleep 1
+    echo -en "${BOLD}.${NORMAL}"
+  done
+  echo -e " ${BAD}failed${NORMAL}"
+  return 1
+}
+
+function isPkgInstalled() {
+  local PKG="${1}" ; shift
+
+  case "$( dpkg-query -W -f='${Status}' "${PKG}" 2>/dev/null )" in
+    install\ *) return 0 ;;
+    *)          return 1 ;;
+  esac
+}
+
+function pickImageToDeploy() {
+  # Look at the wildfly-deploy.sh script to get an indea where I "stole" this code from:
+  # /proc/mounts contains (amongst other things) mounted squashfs images. That's what
+  # we're after:
+  #    /dev/loop0 /opt/deploymentStage/PLS-6.03.22/mounted squashfs ro,relatime 0 0
+  #    /dev/loop1 /opt/deploymentStage/PLS-6.03.21/mounted squashfs ro,relatime 0 0
+  #    /dev/loop4 /opt/deploymentStage/PLS-6.05.00-QA-25/mounted squashfs ro,relatime 0 0
+  IMAGES=$(
+    sed -ne "s|/dev/loop[0-9][0-9]*  */opt/deploymentStage/PLS-\([789]\.[0-9\.]*\)/mounted.*|\1|p" \
+      < /proc/mounts
+  )
+  [ -z "${IMAGES}" ] && return 1
+  case $( echo -e "${IMAGES}" | wc -l ) in
+    1) # Exactly one image present => let's pick that one
+      PLS_IMAGE_TAG="${IMAGES}"
+      return 0
+      ;;
+  esac
+  # Multiple images present, let's let the user pick one
+  PLS_IMAGE_TAG=
+  while [ -z "${PLS_IMAGE_TAG}" ]; do
+    echo -e "\n ${GOOD}*${NORMAL} ${BOLD}Multiple suitable PLS images present:${NORMAL}"
+    echo -e "${IMAGES}" | sed -e 's/^/    >> /'
+    echo -en "\n   ${BOLD}Please enter the tag to deploy:${NORMAL} "
+    read -e ENTERED_PLS_IMAGE_TAG
+    PLS_IMAGE_TAG=$(
+      echo -e "${IMAGES}" | sed -ne "/^${ENTERED_PLS_IMAGE_TAG}$/p"
+    )
+    [ -z "${PLS_IMAGE_TAG}" ] \
+      && echo -en "\n ${BAD}* ${ENTERED_PLS_IMAGE_TAG}${NORMAL} ${BOLD}is not a valid PLS image tag.${NORMAL}\n"
+  done
+  return 0
+}
+
+
+
+
+### Preflight check
+#
+# Runs some sanity checks:
+#  * Make sure there's no *directory* /opt/wildfly (symlink is ok)
+#  * Set up $JBOSS7_DIR and make sure we know where the original jboss7 dir is
+#
+# Vars set:
+#  * $JBOSS7_DIR
+#
+function doPreflightCheck() {
+  # Check if there's a *directory* $WILDFLY_SYMLINK that is
+  # *not* a symlink to a directory
+  if [ -d "${WILDFLY_SYMLINK}" ]; then
+    # Could be a symlink (???), which would be ok
+    if [ ! -L "${WILDFLY_SYMLINK}" ]; then
+      die "\n ${GOOD}*${NORMAL} ${BOLD}A directory${NORMAL} ${BAD}${WILDFLY_SYMLINK}${NORMAL} ${BOLD}already exists!${NORMAL}\n\n   This directory is in the way and most likely will break the conversion. Please fix and try again.\n" 6
+    fi
+  fi
+
+  if [ -L "${JBOSS7_SYMLINK}" ]; then
+    JBOSS7_DIR="$( readlink -f "${JBOSS7_SYMLINK}" )"
+  else
+    JBOSS7_DIR="$( ls -1d /opt/gwn/jboss-as-* 2>/dev/null )"
+  fi
+  [ -z "${JBOSS7_DIR}" ] && die "\n ${BAD}*${NORMAL} ${BOLD}Could not detect${NORMAL} ${BAD}JBoss7 directory${NORMAL}\n   There is no JBoss 7 directories present." 5
+  [ $( echo -e "${JBOSS7_DIR}" | wc -l ) -eq 1 ] || die "\n ${BAD}*${NORMAL} ${BOLD}Could not detect${NORMAL} ${BAD}JBoss7 directory${NORMAL}\n   There is more than one JBoss 7 directories present:\n$( echo -e "${JBOSS7_DIR:-<none>}" | sed -e 's/^/    /' )" 5
+
+  # Since there shouldn't be a Wildfly installation (yet) we don't check
+  # for that directory here but rather after the "install" phase
+}
+
+
+
+### Check for suitable PLS images and (eventually) update from remote
+#
+# Check if we have suitable PLS images for Wildfly. If not, unconditionally. Otherwise,
+# ask user for confirmation to update and eventually update.
+function doCheckAndUpdatePlsImages() {
+  local WAIT_TIME=0
+  local UPDATE_IMAGES=true
+  while true; do
+    [ $( ls /opt/tmp/fetch-image-*.lock 2>/dev/null | wc -l ) -eq 0 ] \
+      && break
+    if [ ${WAIT_TIME} -eq 0 ]; then
+      echo -e " ${GOOD}*${NORMAL} ${BOLD}PLS images are currently being updated, waiting for that process to finish...${NORMAL}\n"
+    fi
+    sleep 1
+    (( WAIT_TIME++ ))
+  done
+
+  echo -e " ${GOOD}*${NORMAL} ${BOLD}Suitable PLS images present:${NORMAL}"
+  IMAGE_COUNT=$( ls -1 /opt/deploymentStage/ 2>/dev/null | sed -n -e 's/^PLS-\([789]\.[0-9\.]*\)$/     \1/p' | tee /dev/stderr | wc -l )
+
+  if [ ${IMAGE_COUNT} -eq 0 ]; then
+    echo -e "   ${WARN}<none>${NORMAL}\n"
+    if [ ${WAIT_TIME} -gt 0 ]; then
+      echo -e " ${BAD}*${NORMAL} ${BOLD}Note that there was a process to update PLS images just now.${NORMAL}\n   Since there are no images present now I assume updating may not improve things."
+      askYesNo "\nDo you want to update the PLS images now (this may take some time)?" \
+        || UPDATE_IMAGES=false
+    fi
+  else
+    [ ${WAIT_TIME} -gt 0 ] \
+      && echo -e "\n ${GOOD}*${NORMAL} ${BOLD}Note:${NORMAL} Three just has been a process that udpated the list of images.\n   Updating again may not yield new/different images."
+    askYesNo "\nDo you want to update the PLS images now (this may take some time)?" \
+        || UPDATE_IMAGES=false
+    echo
+  fi
+  if ${UPDATE_IMAGES}; then
+    echo -e " ${GOOD}*${NORMAL} ${BOLD}Updating PLS images...${NORMAL}"
+    /opt/gwn/system/fetch-pls-image.sh $( ${DEBUG} && echo -n "--debug" )
+    echo
+  fi
+}
+
+
+
+### Show current status
+#
+# Show status to user:
+#   * JBoss7 dir found
+#   * Current Wildfly install phase
+#
+# This function dies (with an appropriate message), if:
+#   * no suitable image is present (unless this conversion is run on a slave
+#   * current wildfly status is "activate" but no wildfly directory is found
+#
+# Vars set:
+#  * $IMAGE_COUNT: number of suitable PLS images
+function showCurrentStatus() {
+  local ROLE=
+  [ ${#:-0} -gt 0 ] && ROLE="${1}" && shift
+
+  echo
+  if [ "${ROLE:-}" != "slave" ]; then
+    echo -e " ${GOOD}*${NORMAL} ${BOLD}PLS Image to be deployed :${NORMAL} ${HILITE}${PLS_IMAGE_TAG}${NORMAL}"
+  fi
+  echo   -e " ${GOOD}*${NORMAL} ${BOLD}Current JBoss 7 directory:${NORMAL} ${HILITE}${JBOSS7_DIR}${NORMAL}"
+  local WILDFLY_STATUS=$( getWildflyState )
+  case "${WILDFLY_STATUS}" in
+    ""|install)
+      echo -e " ${GOOD}*${NORMAL} ${BOLD}Current Wildfly state    :${NORMAL} ${HILITE}${WILDFLY_STATUS:-<none>}${NORMAL}"
+      # Nothing to do here
+      ;;
+    activate)
+      echo -e " ${GOOD}*${NORMAL} ${BOLD}Current Wildfly state    :${NORMAL} ${HILITE}${WILDFLY_STATUS:-<none>}${NORMAL}"
+   
+      # Make sure that we have (at least) one Wildfly directory
+      local WILDFLY_DIR="$( ls -1d /opt/gwn/wildfly-* 2>/dev/null )"
+      [ -z "${WILDFLY_DIR}" ] \
+        && die "\n ${BAD}*${NORMAL} ${BOLD}Status is set to ${BAD}${WILDFLY_STATUS}${NORMAL} ${BOLD}but there is ${BAD}no${NORMAL} ${BOLD}Wildfly directory${NORMAL}\n" 8
+
+#     echo -e "   Skipping wildfly install phase.\n   If you want to repeat this step you need to manually change\n      ${HILITE}wildfly: ${WILDFLY_STATUS}${NORMAL}\n   to\n      ${HILITE}wildfly: install${NORMAL}\n   in /etc/gwn/server.conf and repeat the installation."
+      ;;
+    *)
+      die " ${BAD}*${NORMAL} ${BOLD}Bad wildfly state        :${NORMAL} ${BAD}${WILDFLY_STATUS}${NORMAL}\n   Cannot continue. Please fix\n      ${HILITE}/etc/gwn/server.conf${NORMAL}\n   and repeat the installation.\n" 4
+      ;;
+  esac
+}
+
+
+
+
+### Show a reminder about /etc/profile
+#
+function showProfileUpdate () {
+  echo -e "\n\n${BOLD}If you want to continue to use this shell you need to execute${NORMAL}\n    ${HILITE}source /etc/profile${NORMAL}\n\n(or you can simply log out and log in again)\n\nYou need to do this for any shell you have open on this server." | ${FOLD}
+  exit
+}
+
+
+
+### Run the "install" phase of wildfly
+#
+# This function does a Highstate with "wildfly: install". The function does nothing
+# if the current wildfly status in /etc/gwn/server.conf is already set to "activate"
+# (assuming that "install" has previously succeeded).
+#
+# This function dies if there is no symlink /opt/wildfly after the highstate.
+function doInstallWildfly() {
+  local WILDFLY_STATUS=$( getWildflyState )
+  case "${WILDFLY_STATUS}" in
+    "")
+      # Add "wildfly: install" before "server_features:..." with the correct indendation
+      changeWildflyState "install"
+      DO_INSTALL=true
+      ;;
+    install)
+      # Don't need to do anything, let's just keep it and repeat the salt-call
+      DO_INSTALL=true
+      ;;
+    activate)
+      DO_INSTALL=false
+      ;;
+  esac
+
+  if ${DO_INSTALL}; then
+    echo
+    printTitle "Updating from Salt" "${GOOD}"
+    WILDFLY_STATUS=$( getWildflyState )
+    echo -e "\n ${GOOD}*${NORMAL} ${BOLD}New wildfly state:${NORMAL} ${HILITE}${WILDFLY_STATUS:-<none yet>}${NORMAL}"
+    echo -e "\n ${GOOD}*${NORMAL} ${BOLD}Running high-state...${NORMAL}"
+
+    # Seems that in this phase we *do* need the jboss7 symlink
+    # In case we lost it (e.g., re-ran this script, which removed it prior) we
+    # need to recreate it
+    [ -L "${JBOSS7_SYMLINK}" ] \
+      || ln -s "${JBOSS7_DIR}" "${JBOSS7_SYMLINK}"
+
+    salt-call state.highstate $( ${DEBUG} && echo -n "-l info" )
+    dieIfError "${BOLD}Failed to${NORMAL} ${BAD}high-state${NORMAL}${BOLD}.${NORMAL}"
+
+    [ -L "${WILDFLY_SYMLINK}" ] \
+      || die "\n ${BAD}*${NORMAL} ${BAD}Symlink \"${WILDFLY_SYMLINK}\" missing${NORMAL} ${BOLD}after a high-state.${NORMAL}\n   Something must have gone wrong.\n" 8
+
+    # Change the wildfly status in /etc/gwn/server.conf here (prematurely) so that
+    # if we re-run this script we can skip the install phas
+    echo -e "\n ${GOOD}*${NORMAL} ${BOLD}Switching wildfly state to ${NORMAL}${HILITE}activate${NORMAL}${BOLD}...${NORMAL}"
+    changeWildflyState "activate"
+    WILDFLY_STATUS=$( getWildflyState )
+    echo -e "\n ${GOOD}*${NORMAL} ${BOLD}Wildfly state:${NORMAL} ${HILITE}${WILDFLY_STATUS:-<none yet>}${NORMAL}"
+  else
+    [ -L "${WILDFLY_SYMLINK}" ] \
+      || die "\n ${BAD}*${NORMAL} ${BOLD}No${NORMAL} ${BAD}symlink \"${WILDFLY_SYMLINK}\" present${NORMAL} ${BOLD}even though wildfly state is ${WILDFLY_STATUS}.${NORMAL}\n   Something must have gone wrong.\n" 8
+
+  fi
+}
+
+
+
+### Activate the wildfly install
+#
+# Perform the "activate" phase. This function sets the wildfly status to "activate"
+# in /etc/gwn/server.conf and performs a Highstate.
+#
+# The function dies with an appropriate message if the salt-call fails (which seems to be the
+# case ... never)
+function doActivateWildfly() {
+  changeWildflyState "activate"
+  WILDFLY_STATUS=$( getWildflyState )
+  echo -e "\n ${GOOD}*${NORMAL} ${BOLD}Wildfly state:${NORMAL} ${HILITE}${WILDFLY_STATUS:-<none yet>}${NORMAL}"
+  echo -e "\n ${GOOD}*${NORMAL} ${BOLD}Running high-state...${NORMAL}"
+  salt-call state.highstate $( ${DEBUG} && echo -n "-l info" )
+  dieIfError "${BOLD}Failed to${NORMAL} ${BAD}high-state${NORMAL} ${BOLD}to activate Wildfly.${NORMAL}"
+}
+
+
+
+### Update the files that contain the server information
+#
+# Update server info files and then re-source /etc/profile.
+#
+# Note: sourcing /etc/profile will *not* affect the shell that called this script.
+function doUpdateServerInfo() {
+  /opt/gwn/system/gen-srv-info
+  test -x /opt/gwn/python/server-report.py && /opt/gwn/python/server-report.py
+  # Ok, sourcing /etc/profile from within this script seems to trip over the "-u" flag,
+  # so temporarily disable this feature
+  set +u
+  . /etc/profile
+  set -u
+}
+
+
+
+### Allow user to deploy Wildfly PLS image
+#
+# Runs the wildfly-deploy.sh script that allows the user to pick
+# a PLS image to deploy.
+#
+# This function dies if the wildfly-deploy.sh script exits with a non-zero exit status.
+function doDeployPls() {
+  local BASE_ERROR_MSG="${BOLD}Could not deploy${NORMAL} ${BAD}Wildfly compatible image${NORMAL} ${BOLD}.${NORMAL}"
+  JBOSS7_STANDALONE=true /opt/gwn/system/wildfly-deploy.sh "${PLS_IMAGE_TAG}" -n
+  local RESULT=${?}
+  case ${RESULT} in
+    0)
+      ;;
+    1)
+      die "${BASE_ERROR_MSG} ${BOLD}(Generic Error)${NORMAL}" ${RESULT}
+      ;;
+    10)
+      die "${BASE_ERROR_MSG} ${BOLD}(Cannot find requested PLS version, ${PLS_IMAGE_TAG} was requested by this script)${NORMAL}" ${RESULT}
+      ;;
+    11)
+      die "${BASE_ERROR_MSG} ${BOLD}(Unable to stop Wildfly)${NORMAL}" ${RESULT}
+      ;;
+    12)
+      die "${BASE_ERROR_MSG} ${BOLD}(Unable to run Liquibase)${NORMAL}" ${RESULT}
+      ;;
+    13)
+      die "${BASE_ERROR_MSG} ${BOLD}(One of the deployment-script files failed to execute)${NORMAL}" ${RESULT}
+      ;;
+    14)
+      die "${BASE_ERROR_MSG} ${BOLD}(XA datasource property not found in ${HILITE}standalone.xml${NORMAL}${BOLD})${NORMAL}" ${RESULT}
+      ;;
+    *)
+      die "${BASE_ERROR_MSG} ${BOLD}(Deployment script returned unknown error ${RESULT})${NORMAL}" ${RESULT}
+      ;;
+  esac
+}
+
+
+### Rsync JBoss to Wildfly
+#
+# Rsyncs the deployments of the old JBoss7 folder over to the new Wildfly folder.
+#
+# Parameters:
+#   #1: Root of the old JBoss7 directory
+#   #2: Root of the new Wildfly directory
+#
+# This function dies if the rsync fails.
+function doRsyncJBossToWildfly() {
+  local JBOSS7_DIR="${1}"   ; shift
+  local WILDFLY_DIR="${1}" ; shift
+
+  echo -e "\n ${GOOD}*${NORMAL} ${HILITE}${JBOSS7_DIR}${NORMAL}  ${BOLD}--->${NORMAL}  ${HILITE}${WILDFLY_DIR}${NORMAL}"
+  rsync -a \
+    $( ${DEBUG} && echo -n "-v --progress" ) \
+    --exclude='/pls.ear*' \
+    --exclude='/README.txt' \
+    "${JBOSS7_DIR}/standalone/deployments/." \
+    "${WILDFLY_DIR}/standalone/deployments/."
+  dieIfError "${BOLD}Could not${NORMAL} ${BAD}copy existing deployemnts${NORMAL}."
+  chown -R jboss:jboss /opt/gwn/wildfly-9.0.2.Final
+}
+
+
+
+### Print the current status of the Wildfly install phase as defined in /etc/gwn/server.conf
+#
+function getWildflyState() {
+  sed -n -e 's/^  *wildfly: \(.*\)$/\1/p' /etc/gwn/server.conf
+}
+
+
+
+### Change the wildfly status in /etc/gwn/server.conf
+#
+function changeWildflyState() {
+  local NEW_STATUS="${1}" ; shift
+
+  local OLD_STATUS=$( getWildflyState )
+  case "${OLD_STATUS}" in
+    "")
+      # Need to add new status since it wasn't in server.conf yet
+      # The following sed command looks for a line with "is_production:...." and if found
+      # appends another line with the same indendation a la "wildfly: <new state>".
+      sed -e "s/^\(  *\)\(is_production:\)/\1wildfly: ${NEW_STATUS}\n\1\2/" /etc/gwn/server.conf -i
+      ;;
+    "${NEW_STATUS}")
+      # Same status like the one defined in server.conf => do nothing
+      ;;
+    *)
+      sed -e "s/^\(  *wildfly: *\).*/\1${NEW_STATUS}/" /etc/gwn/server.conf -i
+      ;;
+  esac
+}
+
+function waitForProcessToDisappear() {
+  local PID="${1}"     ; shift
+  local WAIT_TIME=${1} ; shift
+
+  echo -en "${HIDE_CURSOR}"
+  local WAIT=
+  for WAIT in $( seq ${WAIT_TIME} -1 1 ); do
+    ${TPUT} sc
+    echo -en " ${WAIT}"
+    ${TPUT} el
+    sleep 1
+    ${TPUT} rc
+    if [ ! -L "/proc/${PID}/exe" ]; then
+      echo -en "${SHOW_CURSOR}"
+      showEndMarker "ok" "${GOOD}"
+      return 0
+    fi
+  done
+  echo -en "${SHOW_CURSOR}"
+  showEndMarker "failed" "${BAD}"
+  return 1
+}
+
+### Stops *any* instance of JBoss or Wildfly
+#
+function stopPlsNonRas() {
+  local JBOSS_PID=$( jps | sed -ne 's/^\([1-9][0-9]*\) jboss-modules.jar/\1/p'  )
+
+  if [ -n "${JBOSS_PID}" ]; then
+    echo -en "\n ${GOOD}*${NORMAL} ${BOLD}Stopping PLS: PID${NORMAL} ${HILITE}${JBOSS_PID}${NORMAL}${BOLD}..."
+    kill -SIGTERM "${JBOSS_PID}"
+    waitForProcessToDisappear ${JBOSS_PID} 60
+    if [ ${?} -ne 0 ]; then
+      # Didn't die
+      echo -en "\n ${WARN}*${NORMAL} ${BOLD}Killing PLS: PID${NORMAL} ${HILITE}${JBOSS_PID}${NORMAL}${BOLD}..."
+      kill -SIGKILL "${JBOSS_PID}"
+      waitForProcessToDisappear ${JBOSS_PID} 60
+      if [ ${?} -ne 0 ]; then
+        die "\n${BOLD}Could not terminate PLS.${NORMAL}\nPlease investigate and fix." 8
+      fi
+    fi
+  fi
+}
+
+function switchMeOnline() {
+  echo
+  printTitle "Go Online" "${GOOD}"
+  echo -en "\n ${GOOD}*${NORMAL} ${BOLD}Switching${NORMAL} ${HILITE}${THIS_NODE}${NORMAL} ${BOLD}to${NORMAL} ${HILITE}online${NORMAL}"
+  crm node online "${THIS_NODE}"
+  showEndMarker "ok" "${GOOD}"
+}
+
+
+### Convert a non-RAS appserver
+#
+function doSingleServerConversion() {
+  doPreflightCheck
+
+  printTitle "Updating list of images" "${GOOD}"
+  echo
+  doCheckAndUpdatePlsImages
+
+  pickImageToDeploy || die "\n ${BAD}*${NORMAL} ${BAD}No suitable image${NORMAL} ${BOLD}chosen for deployment.${NORMAL}" 10
+
+  printTitle "Review And Convert?" "${GOOD}"
+  showCurrentStatus
+  echo
+  askYesNo "Do you want to continue?" \
+    || exit 0
+
+  if isPkgInstalled wildfly; then
+    echo -e "\n ${GOOD}*${NORMAL} ${BOLD}Skipping wildfly install phase${NORMAL} (already done)"
+  else
+    doInstallWildfly
+  fi
+
+
+  echo
+  printTitle "(Pre)Synchronizing deployments from old Jboss7 to Wildfly" "${GOOD}"
+
+  # Check if we got the symlink $WILDFLY_SYMLINK. If that one isn't there something
+  # is wrong and needs to be fixed.
+  [ -L "${WILDFLY_SYMLINK}" ] || die "\n ${BAD}*${NORMAL} ${BOLD}The symlink${NORMAL} ${BAD}\"${WILDFLY_SYMLINK}\" seems to be missing${NORMAL}${BOLD}.${NORMAL}\n   Something must have gone wrong during one of the previous steps. Please check and try again." 7
+
+
+  # Rsync stuff over from JBoss 7
+  WILDFLY_DIR=$( readlink -f "${WILDFLY_SYMLINK}" )
+  doRsyncJBossToWildfly "${JBOSS7_DIR}" "${WILDFLY_DIR}"
+
+  echo
+  printTitle "Stopping JBoss" "${GOOD}"
+  # Do NOT use "stopJBoss" here...
+  stopPlsNonRas
+  
+
+  echo
+  printTitle "Synchronizing deployments from old Jboss7 to Wildfly (Final)" "${GOOD}"
+
+
+  # Rsync stuff over from JBoss 7
+  doRsyncJBossToWildfly "${JBOSS7_DIR}" "${WILDFLY_DIR}"
+
+
+  echo
+  printTitle "Activating Wildfly" "${GOOD}"
+  doActivateWildfly
+
+
+  echo
+  printTitle "Updating server info" "${GOOD}"
+  echo
+  doUpdateServerInfo
+  trap 'showProfileUpdate ; restoreTty ; exit 0' EXIT
+
+  echo
+  printTitle "Deploying new image" "${GOOD}"
+  doDeployPls
+
+
+  echo
+  printTitle "Done" "${GOOD}"
+  waitForWildflyUp  40 || exit 9
+  waitForDebugLog 40 || exit 9
+  echo -e "\n ${GOOD}*${NORMAL} ${BOLD}I'm starting to show you the debug log now. Hit Ctrl+C at any time.${NORMAL}\n"
+  tailf -n 1000 "${WILDFLY_DIR}/standalone/log/debug.log"
+}
+
+
+
+
+
+
+### Perform a "RAS conversion"
+#
+function doRasConversion() {
+  local ROLE="${1}" ; shift
+
+  echo
+  printTitle "" "${GOOD}"
+  printTitle "Convert to Wildfly: ${ROLE^}" "${GOOD}"
+  printTitle "" "${GOOD}"
+
+  doPreflightCheck
+
+  if [ "${ROLE}" = "master" ]; then
+    echo
+    printTitle "Updating list of images" "${GOOD}"
+    echo
+    doCheckAndUpdatePlsImages
+    pickImageToDeploy || die "\n ${BAD}*${NORMAL} ${BAD}No suitable image${NORMAL} ${BOLD}chosen for deployment.${NORMAL}" 10
+  fi
+
+
+  echo
+  printTitle "Review And Convert?" "${GOOD}"
+  echo
+  "${BASE_DIR}/system-status"
+  showCurrentStatus "${ROLE}"
+  echo -en "\n${BOLD}Note:${NORMAL} You should start this script on "
+  local SEPERATOR=
+  for NODE in ${PEER_NODE_LIST}; do
+    echo -en "${SEPERATOR}${HILITE}${NODE}${NORMAL}"
+    SEPERATOR=", "
+  done
+  echo -e " now.\nThe instances of this script will wait for the other node(s) when needed.\n" \
+    | ${FOLD}
+  askYesNo "Do you want to continue?" \
+    || exit 0
+
+  if isPkgInstalled wildfly; then
+    echo -e "\n ${GOOD}*${NORMAL} ${BOLD}Skipping wildfly install phase${NORMAL} (already done)"
+  else
+    doInstallWildfly
+  fi
+
+  # Check if we got the symlink $WILDFLY_SYMLINK. If that one isn't there something
+  # is wrong and needs to be fixed.
+  [ -L "${WILDFLY_SYMLINK}" ] || die "\n ${BAD}*${NORMAL} ${BOLD}The symlink${NORMAL} ${BAD}\"${WILDFLY_SYMLINK}\" seems to be missing${NORMAL}${BOLD}.${NORMAL}\n   Something must have gone wrong during one of the previous steps. Please check and try again." 7
+
+
+  if [ "${ROLE}" = "master" ]; then
+    echo
+    printTitle "(Pre)Synchronizing deployments from old Jboss7 to Wildfly" "${GOOD}"
+
+    # Rsync stuff over from JBoss 7
+    WILDFLY_DIR=$( readlink -f "${WILDFLY_SYMLINK}" )
+    doRsyncJBossToWildfly "${JBOSS7_DIR}" "${WILDFLY_DIR}"
+
+    # Stop JBoss if we're the master
+    echo
+    printTitle "Stopping JBoss" "${GOOD}"
+    # Hmmmmm... can't rely on the $RSC_APPSERVER or $LBL_APPSERVER variables
+    # since at this time we can be in an inconsistent state if this script was restarted
+    # after the "activate" highstate. Let's query the cluster instead for what we have:
+    RSC_APPSERVER=$( "${CRM_RESOURCE}" --list-raw | egrep 'JBoss|Wildfly' )
+    JBOSS_TIMEOUT=$(
+      "${CRM}" configure show "${RSC_APPSERVER}" \
+        | sed -ne 's/.*op stop .*timeout="\([0-9]*\)".*/\1/p'
+    )
+    [ -z "${JBOSS_TIMEOUT}" ] && JBOSS_TIMEOUT=120
+    (( JBOSS_TIMEOUT += 10 ))
+    crm resource stop "${RSC_APPSERVER}"
+    local JBOSS_PID=$( jps | sed -ne 's/^\([1-9][0-9]*\) jboss-modules.jar/\1/p'  )
+    if [ -n "${JBOSS_PID}" ]; then
+      echo -en "\n ${GOOD}*${NORMAL} ${BOLD}Waiting for ${RSC_APPSERVER} to stop...${NORMAL}"
+      waitForProcessToDisappear ${JBOSS_PID} ${JBOSS_TIMEOUT}
+    else
+      echo -e "\n ${GOOD}*${NORMAL} ${BOLD}JBoss seems to be already stopped${NORMAL}"
+    fi
+
+    echo
+    printTitle "Synchronizing deployments from old Jboss7 to Wildfly (Final)" "${GOOD}"
+
+    # Rsync stuff over from JBoss 7
+    doRsyncJBossToWildfly "${JBOSS7_DIR}" "${WILDFLY_DIR}"
+    chown -R jboss:jboss /opt/gwn/wildfly-9.0.2.Final
+  fi
+
+  echo
+  printTitle "Activating Wildfly" "${GOOD}"
+  doActivateWildfly
+
+  echo
+  printTitle "Updating server info" "${GOOD}"
+  echo
+  doUpdateServerInfo
+  # Don't need the original trap to restore the tty settings since we're
+  # not using "read" w/o echoing anymore... so we can just set up a new trap
+  # for INT (the other signals stay the same, though).
+  trap showProfileUpdate INT
+
+  if [ "${ROLE}" = "master" ]; then
+
+    echo -e "\n ${WARN}*${NORMAL} ${REALLYBAD}Warning:${NORMAL} ${BOLD}Do ${BAD}NOT${NORMAL} ${BOLD}start Wildfly${NORMAL}\n   at the end of the deployment!"
+    doDeployPls
+
+    echo -en "\n ${GOOD}*${NORMAL} ${BOLD}Waiting a bit to check if there is some Wildfly process going to appear${NORMAL}\n   (which would be bad!):${HIDE_CURSOR}"
+    for WAIT in $( seq 10 -1 1 ); do
+      ${TPUT} sc
+      echo -en " ${WAIT}"
+      ${TPUT} el
+      sleep 1
+      ${TPUT} rc
+      local JBOSS_PID=$( jps | sed -ne 's/^\([1-9][0-9]*\) jboss-modules.jar/\1/p'  )
+      if [ -n "${JBOSS_PID}" ]; then
+        kill -SIGKILL ${JBOSS_PID}
+        echo -en "${SHOW_CURSOR}"
+        showEndMarker "failed" "${BAD}"
+        echo -e "\n ${BAD}* Killed Wildfly PID${NORMAL} ${HILITE}${JBOSS_PID}${NORMAL}\n   (You were ${BOLD}NOT${NORMAL} supposed to start Wildfly!)"
+        break
+      fi
+    done
+    [ -z "${JBOSS_PID}" ] && showEndMarker "ok" "${GOOD}"
+
+    echo -en "\n ${GOOD}*${NORMAL} ${BOLD}Waiting for all peers to no longer be online${NORMAL}${HIDE_CURSOR}"
+    WAIT_TIME=0
+    # Now wait for the slave to go into standby
+    while true; do
+      ONLINE_NODES=$(
+        getNodeList \
+          | sed -ne 's/^\([^t]*\)\t.*\tonline/\1/p'
+      )
+      ${TPUT} sc
+      echo -en " (remaining online nodes:"
+      for NODE in ${ONLINE_NODES}; do
+        echo -en " ${HILITE}${NODE}${NORMAL}"
+      done
+      echo -en ")"
+      ${TPUT} el
+      if [ ${WAIT_TIME} -eq 60 ]; then
+        echo -en "\n(Make sure that you run this script on the peer(s) and that it runs correctly!)\n\n ${GOOD}*${NORMAL} ${BOLD}Waiting for all peers to no longer be online${NORMAL}"
+      fi
+      [ "${ONLINE_NODES}" = "${THIS_NODE}" ] && break
+      sleep 1
+      ${TPUT} rc
+      (( WAIT_TIME++ ))
+    done
+    echo -en "${SHOW_CURSOR}"
+    ${TPUT} ed
+    showEndMarker "ok" "${GOOD}"
+
+  else
+
+    printTitle "Wait For Reconfiguration" "${GOOD}"
+
+  fi
+
+  echo -en "\n ${GOOD}*${NORMAL} ${BOLD}Switching ${HILITE}${THIS_NODE}${NORMAL}${BOLD} to ${HILITE}standby${NORMAL}"
+  crm node standby "${THIS_NODE}"
+  showEndMarker "ok" "${GOOD}"
+  echo
+
+  if [ "${ROLE}" = "master" ]; then
+
+    printTitle "Updating Cluster Information Base" "${WARN}"
+    
+    echo -en "\n ${GOOD}*${NORMAL} ${BOLD}Waiting for all resources to be stopped...${NORMAL}${HIDE_CURSOR}"
+    WAIT_TIME=0
+    # Now wait for the slave to go into standby
+    while true; do
+      RESOURCE_COUNT=$(
+        for RESOURCE in $( "${CRM_RESOURCE}" --list-raw | cut -d: -f1 | sort | uniq ); do
+          "${CRM_RESOURCE}" --resource "${RESOURCE}" --locate 2>&1
+        done \
+          | sed -ne 's/resource \(.*\) is running on: \([^ ]*\).*$/\1/p' \
+        | wc -l
+      )
+      ${TPUT} sc
+      echo -en " (${HILITE}${RESOURCE_COUNT}${NORMAL} remaining active resources)"
+      ${TPUT} el
+      [ ${RESOURCE_COUNT} -eq 0 ] && break
+      sleep 1
+      ${TPUT} rc
+      (( WAIT_TIME++ ))
+    done
+    echo -en "${SHOW_CURSOR}"
+    showEndMarker "ok" "${GOOD}"
+
+    echo -e "\n ${WARN}*${NORMAL} ${BOLD}Updating CIB...${NORMAL}"
+    ${CRM} configure load replace <( grep -v '^#' "${CIB}" )
+
+    switchMeOnline
+
+  else # Slave
+
+    # Wait for the cluster to be configured for Wildfly (instead of JBoss)
+
+    echo -en " ${GOOD}*${NORMAL} ${BOLD}Waiting for the cluster to have the${NORMAL} ${HILITE}Wildfly${NORMAL} ${BOLD}resouce...${NORMAL}${HIDE_CURSOR}"
+    WAIT_TIME=0
+    while true; do
+      RSC_APPSERVER=$( "${CRM_RESOURCE}" --list-raw | egrep 'Wildfly' )
+      [ -n "${RSC_APPSERVER}" ] && break
+      sleep 1
+      (( WAIT_TIME++ ))
+    done
+    echo -en "${SHOW_CURSOR}"
+    showEndMarker "ok" "${GOOD}"
+
+    echo -en "\n ${GOOD}*${NORMAL} ${BOLD}Waiting for Wildfly to start on the master node...${NORMAL}"
+    WAIT_TIME=0
+    while true; do
+      WILDFLY_HOST=$( locateJBoss )
+      LOCATION=${?}
+      case ${LOCATION} in
+        0) # Wildfly doesn't run => wait some more
+          ;;
+        1) # Wildfly runs locally
+          showEndMarker "huh? started on ${HILITE}${WILDFLY_NODE}" "${WARN}"
+          echo -e "\n ${WARN}*${NORMAL} ${BOLD}It seems this cluster had a role switch.\n   Wildfly was started on the (previous)${NORMAL} ${HILITE}Slave${NORMAL}\n\n ${BAD}* NOT syncing from appserver${NORMAL}\n   (Hoping that the cluster will sort things out...)"
+
+          switchMeOnline
+          break
+          ;;
+        2) # Appserver IP is remote
+          showEndMarker "started on ${HILITE}${WILDFLY_HOST}" "${GOOD}"
+
+          switchMeOnline
+
+          echo
+          printTitle "Sync From Appserver" "${GOOD}"
+
+          echo -e "\n ${GOOD}*${NORMAL} ${BOLD}Syncing from appserver...${NORMAL}"
+          "${BASE_DIR}/sync-from-appserver"
+          break
+          ;;
+      esac
+    done
+
+    # Wait for the other node(s) to come online again
+    echo -en "\n ${GOOD}*${NORMAL} ${BOLD}Waiting for other node(s) to come online again...${NORMAL}"
+    while true; do
+      ONLINE_NODE_COUNT=$(
+        getNodeList \
+          | sed -ne 's/^\([^t]*\)\t.*\tonline/\1/p' \
+          | wc -l
+      )
+      [ ${ONLINE_NODE_COUNT} -gt 0 ] && break
+      sleep 1
+      (( WAIT_TIME++ ))
+    done
+    showEndMarker "ok" "${GOOD}"
+
+  fi
+
+  echo
+  printTitle "Done" "${GOOD}" >&2
+  echo -e "\n${BOLD}Please monitor the cluster with${NORMAL} ${HILITE}system-status${NORMAL} to ensure that all services are starting up again.\n"
+}
+
+
+
+################################################################################
+###
+
+### Prepare
+
+ORIG_STTY_SETTINGS=$( stty -g )
+function restoreTty() {
+  stty "${ORIG_STTY_SETTINGS}"
+  echo -en "${SHOW_CURSOR}"
+}
+trap 'restoreTty ; echo ; exit 0' EXIT
+trap 'exit 0' INT
+
+BASE_DIR="$( dirname "$( readlink -f "${BASH_SOURCE[0]}" )" )"
+if [ ! -f "${BASE_DIR}/functions.sh" ]; then echo "'functions.sh' not found" ; exit 1; fi
+. "${BASE_DIR}/functions.sh"
+
+JBOSS7_SYMLINK="/opt/jboss7"
+WILDFLY_SYMLINK="/opt/wildfly"
+
+CIB="${CIB:-/opt/gwn/ras-heartbeat-cib.txt}"
+
+
+### Process parameters
+
+DEBUG=false
+while getopts :d OPT; do
+  case "${OPT}" in
+    d)
+      DEBUG=true
+      ;;
+    \?)
+      die "Unknown option \"${OPTARG}\"" 1
+      ;;
+    :)
+      die "\"${OPTARG}\" requires an argument" 1
+      ;;
+  esac
+done
+shift $(( OPTIND - 1 ))
+if [ ${#} -gt 0 ]; then
+  case "${1,,}" in
+    master|slave)
+      ROLE="${1,,}"
+      shift
+      ;;
+  esac
+fi
+[ ${#} -gt 0 ] && die "Too many parameters" 1
+
+
+if [ -z "${CRM}" ]; then
+
+  # Not on a RAS
+  doSingleServerConversion
+
+else
+
+  # On a RAS => figure out if this server has the appserver IP.
+  # We need to make sure that the cluster software is fired up and ready
+  # first.
+  waitForCluster \
+    "  ${GOOD}*${NORMAL} Waiting for cluster to start up" \
+    "  ${GOOD}*${NORMAL} Waiting for cluster to to elect a DC"
+  CLUSTER_STATUS=${?}
+  case ${CLUSTER_STATUS} in
+    0) # Cluster is up and running, has a DC, and resources defined
+      ;;
+    1) # Cluster is up and running but has no resources defined yet
+      die "${BAD}Cluster does not have any resources defined${NORMAL}." 2
+      ;;
+    #2) # Up and running WITHOUT DC: Can't happen ("waitForCluster" waits for it)
+    #3) # Not running yet: Can't happen ("waitForCluster" waits for it)
+    4) # Failed to extract DC
+      die "${BAD}Could not extract current DC from \"${CRM} status\"${NORMAL}.\n\ncrm status output:\n${CIB_STATUS}" 2
+      ;;
+    5) # Failed to extract resource count
+      die "${BAD}Could not extract resource count from \"${CRM} status\"${NORMAL}.crm status output:\n${CIB_STATUS}" 2
+      ;;
+    6) # Cluster software is not running
+      die "${BAD}Cluster software is not running${NORMAL}." 2
+      ;;
+  esac
+
+  # Initialize some additional variables
+  NODE_LIST=$( getNodeList )
+  THIS_NODE=$( hostname )
+  PEER_NODE_LIST=" $( echo -e "${NODE_LIST}" | cut -d$'\t' -f1 | sort | uniq | tr '$\n' ' ' )"
+  PEER_NODE_LIST="${PEER_NODE_LIST// ${THIS_NODE} / }"
+
+  # Figure out if we have the Appserver IP.
+  APPSERVER_IP_HOST=$( locateAppserverIp )
+  LOCATION=${?}
+  case ${LOCATION} in
+    0) # Appserver IP not configured??!?
+      [ -z "${ROLE:-}" ] \
+        && die "\n ${BAD}*${NORMAL} ${BOLD}Could not determine which server is running JBoss${NORMAL}\n\nPlease rerun this script and specifiy the role of this server, either:\n    ${HILITE}${0} master${NORMAL}\n- or -\n    ${HILITE}${0} slave${NORMAL}" 9
+      doRasConversion "${ROLE}"
+      ;;
+    1) # Appserver IP is local
+      [ -n "${ROLE:-}" ] && [ "${ROLE}" != "master" ] \
+        && die "\n ${BAD}*${NORMAL} ${BOLD}Conversion of this server requested for${NORMAL} ${HILITE}${ROLE}${NORMAL} ${BOLD}but this server is a${NORMAL} ${BAD}master${NORMAL}." 9
+      doRasConversion "master"
+      ;;
+    2) # Appserver IP is remote
+      [ -n "${ROLE:-}" ] && [ "${ROLE}" != "slave" ] \
+        && die "\n ${BAD}*${NORMAL} ${BOLD}Conversion of this server requested for${NORMAL} ${HILITE}${ROLE}${NORMAL} ${BOLD}but this server is a${NORMAL} ${BAD}slave${NORMAL}." 9
+      doRasConversion "slave"
+      ;;
+  esac
+
+fi
+
+# vim: set tabstop=2 softtabstop=0 expandtab shiftwidth=2 smarttab :-

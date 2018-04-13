@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+
+# GWN Service Wrapper
+# Allow control of service no matter if a RAS or Standard Appserver
+# Source function to check if a RAS
+source /opt/gwn/system/functions.sh
+usage() {
+	cat <<EOF_HELP
+GWN Wrapper script to control services
+
+Usage:
+  $0 <service> <command>
+
+Example:
+  $0 dnsmasq restart
+
+Useful services: crossbar, dnsmasq, mysql, ntp, squid, wildfly
+Possible commands: status, start, stop, restart
+EOF_HELP
+}
+# Make sure two variables here passed or either type of help
+# This will exit 1 either way, truly a call to help could exit as 0
+if [[ "$#" -le 1 || "$#" == "--help" || "$#" == "-h" ]]; then
+        usage
+        exit 1
+fi
+RESOURCE=
+CTRL_FILE=
+
+case "${1}" in
+   [lL]ighttpd|[dD]nsmasq)    RESOURCE="ms_${1^}"    ;;
+   [sS]tunnel4)               RESOURCE="Stunnel"    ;;
+   job_agent)                 RESOURCE="JobAgent"   ;;
+   [mM]ysql|[mM]aria[dD][bB]) RESOURCE="ms_MariaDB" ;;
+   [jJ]boss7)                 CTRL_FILE="/opt/gwn/system/jboss7-control.sh" ;;
+   [wW]ildfly)                CTRL_FILE="/opt/gwn/system/wildfly-control.sh" ;;
+esac
+
+if   [ -n "${CTRL_FILE}" ]; then
+   # Have a control file (e.g., jboss7-control)
+   "${CTRL_FILE}" "${2}"
+elif [ -n "${CRM}" -a -n "${RESOURCE}" ]; then
+   # Have a CRM resource *and* we're on a RAS
+   "${CRM}" resource "${2}" "${RESOURCE}"
+else
+   # Plain Old Service
+   service "${1}" "${2}"
+fi

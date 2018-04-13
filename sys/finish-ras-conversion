@@ -1,0 +1,98 @@
+#!/bin/bash -u
+
+
+
+################################################################################
+#
+# Set up variables
+
+CIB="${CIB:-/opt/gwn/ras-heartbeat-cib.txt}"
+
+
+
+################################################################################
+#
+# Set up internal variables
+
+BASE_DIR="$( dirname "$( readlink -f "${BASH_SOURCE[0]}" )" )"
+if [ ! -f "${BASE_DIR}/functions.sh" ]; then echo "'functions.sh' not found" ; exit 1; fi
+. "${BASE_DIR}/functions.sh"
+
+
+MYSQL="$( findExe mysql /bin /usr/bin /usr/local/mysql/bin )"
+MYSQLD="$( findExe mysqld /usr/libexec /usr/sbin /usr/bin )"
+MYSQLDUMP="$( findExe mysqldump /bin /usr/bin /usr/local/mysql/bin )"
+MYSQL_OPTS="${MYSQL_OPTS:-}"
+
+
+
+
+################################################################################
+#
+# Parameter processing
+
+# <none to process>
+
+
+
+################################################################################
+#
+# Report what's gonna happen
+
+echo -e "${BOLD}================================================================================${NORMAL}"
+echo -e "${BOLD}                          Finish Conversion to RAS 2.0                          ${NORMAL}"
+echo -e "${BOLD}================================================================================${NORMAL}"
+
+
+
+################################################################################
+#
+# Main script starts here!
+
+trap 'exit 1' TERM KILL INT
+
+echo -en "\n${GOOD}*${NORMAL} ${BOLD}Checking installation..."
+
+[ -z "${CRM}" ] && die " [${BAD}failed${NORMAL}${BOLD}]${NORMAL}\n\n${BAD}Important heartbeat/pacemaker binaries were not found${NORMAL}.\n * Did phase one of the RAS 2.0 conversion complete correctly?\n   (in case this is a conversion)\n * Did the \"setup\" phase complete correctly?\n   (in case this is a new setup)\n * Is Salt configured correctly for this site?" 1
+
+# Do we have the CIB?
+[ -f "${CIB}" ] \
+	|| die " [${BAD}failed${NORMAL}${BOLD}]${NORMAL}\n\n${BAD}No CIB found${NORMAL}.\n * Did phase one of the RAS 2.0 conversion complete correctly?\n   (in case this is a conversion)\n * Did the \"setup\" phase complete correctly?\n   (in case this is a new setup)\n * Is Salt configured correctly for this site?" 1
+
+
+
+### The whole waiting loop...
+#    * We first need to wait until we can connect to CIB
+#    * Then it will take some additional time until the cluster
+#      elected a DC. We cannot load the new CIB before that happened
+echo -en " [${GOOD}ok${NORMAL}${BOLD}]${NORMAL}\n\n${GOOD}*${NORMAL} ${BOLD}Checking cluster status${NORMAL}"
+waitForCluster \
+	"  ${BOLD}*${NORMAL} Waiting for cluster to start up" \
+	"  ${BOLD}*${NORMAL} Waiting for cluster to to elect a DC"
+case ${?} in
+	0) # Up and running with DC *and* resources
+		die "\n\n${BAD}${CIB_RESOURCE_COUNT} resources already defined in CIB${NORMAL}.\nIt seems that this RAS 2.0 Conversion has already finished." 2
+		;;
+	1) # Up and running with DC but without resources
+		;;
+	#2) # Up and running WITHOUT DC: Can't happen ("waitForCluster" waits for it)
+	#3) # Not running yet: Can't happen ("waitForCluster" waits for it)
+	4) # Could not extract DC
+		die "\n\n${BAD}Could not extract current DC from \"${CRM} status\"${NORMAL}.\n\ncrm status output:\n${CIB_STATUS}" 3
+		;;
+	5) # Could not extract resource count
+		die "\n\n${BAD}Could not extract resource count from \"crm status\"${NORMAL}.\n\ncrm status output:\n${CIB_STATUS}" 3
+		;;
+	6) # Cluster software not started
+		die "\n\n${BAD}The cluster software is not running!${NORMAL}\n\n * Did the \"setup\" phase of the server finish correctly?" 3
+		;;
+	7) # Cluster software was started but disappeared
+		die "\n\n${BAD}The cluster software was running but disappeared!${NORMAL}" 3
+		;;
+esac
+
+${CRM} configure load replace <( grep -v '^#' "${CIB}" )
+
+echo -e "\n${GOOD}********************************************************************************${NORMAL}"
+echo -e "${BOLD}                          RAS 2.0 Conversion Completed                          ${NORMAL}"
+echo -e "${GOOD}********************************************************************************${NORMAL}\n"

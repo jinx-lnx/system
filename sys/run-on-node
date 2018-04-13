@@ -1,0 +1,60 @@
+#!/bin/bash -u
+
+SCRIPT_PATH="$( readlink -f "${BASH_SOURCE[0]}" )"
+BASE_DIR="$( dirname "${SCRIPT_PATH}" )"
+if [ ! -f "${BASE_DIR}/functions.sh" ]; then echo "'functions.sh' not found" ; exit 1; fi
+. "${BASE_DIR}/functions.sh"
+
+[ ${#} -gt 0 ] || die "${BAD}No arguments given${NORMAL}. Please provide the type of node that this script should run on" 1
+
+NODE="${1}" ; shift
+
+WAIT_FOR_CLUSTER=false
+if [ ${#} -gt 0 ]; then
+	if [ "${1}" = "-w" ]; then
+		waitForCluster=true
+		shift
+	fi
+fi
+
+[ ${#} -gt 0 ] || die "Missing script" 2
+SCRIPT="${1}" ; shift
+if [ ! -f "${SCRIPT}" ]; then
+	case "${SCRIPT}" in
+		\.|\*) # Invalid, blow up
+			die "Invalid script \"${SCRIPT}\"" 1
+			;;
+		*)
+			[ -f "${BASE_DIR}/${SCRIPT}" ] && SCRIPT="${BASE_DIR}/${SCRIPT}"
+			;;
+	esac
+fi
+
+HOST=$(
+	if ${WAIT_FOR_CLUSTER}; then
+		sudo "${BASE_DIR}/should-run-on-node" "${NODE}" -w
+	else
+		sudo "${BASE_DIR}/should-run-on-node" "${NODE}"
+	fi
+)
+RESULT=${?}
+case ${RESULT} in
+	0)
+		if [ -x "${SCRIPT}" ]; then
+			"${SCRIPT}" "${@}"
+		elif [ -f "${SCRIPT}" ]; then
+			bash "${SCRIPT}" "${@}"
+		else
+			die "Script \"${SCRIPT}\" not found" 2
+		fi
+		;;
+	1)
+		exit 0
+		# Don't run on node, done, don't need to do anything else
+		;;
+	*)
+		# Any other error, should have been printed by should-run-on-node
+		# However, exit with that result code
+		exit ${RESULT}
+		;;
+esac

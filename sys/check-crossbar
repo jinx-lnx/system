@@ -1,0 +1,267 @@
+#!/opt/crossbar/bin/python
+
+# Make "print" a function, like in python3
+from __future__ import print_function
+
+import re
+import argparse
+import six
+import time
+
+from twisted.internet import reactor
+from twisted.internet.defer import inlineCallbacks
+
+from autobahn.twisted.wamp import ApplicationRunner
+from autobahn.twisted.wamp import ApplicationSession
+
+import socket
+
+available_fields = [
+        { 'field': 'ip', 'title': 'IP', 'max_length': 15 },
+        { 'field': 'gwnuid', 'title': 'GWN UID', 'max_length': 33 },
+        { 'field': 'device', 'title': 'Device' },
+        { 'field': 'session', 'title': 'WAMP Session ID', 'max_length': 16 }
+]
+
+max_lines_without_header = 20
+online_tests = []
+output_fields = []
+one_shot = False
+class CheckInternet():
+
+    def __init__(self, domain):
+        self.domain = domain
+
+    def run(self, ip):
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.connect(('127.0.0.1', 5001))
+            try:
+                s.send('http://{domain}/ {source_ip}/- - GET myip=10.1.4.150 myport=3128?\n'.format(domain=self.domain, source_ip=ip))
+                result = s.recv(2048).strip()
+                if result and result != u'':
+                    return result
+                return '<ok>'
+            finally:
+                s.close()
+        except Exception as e:
+            return 'Exception: {}'.format(e)
+
+    def get_name(self):
+        return u'Check if Internet is allowed'
+
+def get_output_fields_formatter():
+    return '  '.join([
+        '{{{name}:<{length}}}'.format(name=field['field'], length=field['max_length']) if 'max_length' in field
+        else '{{{name}}}'.format(name=field['field'])
+        for field in output_fields]
+        )
+
+def print_table_title():
+    print('       ' + get_output_fields_formatter()
+          .format(**{field['field']: field['title'] for field in output_fields}))
+
+class ClientSession(ApplicationSession):
+
+    def __init__(self, *args, **kwargs):
+        super(ClientSession, self).__init__(*args, **kwargs)
+        self.lines_printed_since_title = 0
+
+    def print_table_line(self, line, dontSplit=False):
+        if not dontSplit and max_lines_without_header > 0 and self.lines_printed_since_title >= max_lines_without_header:
+            self.lines_printed_since_title = 0 # We're resetting here since we're going to print the title
+        if self.lines_printed_since_title == 0:
+            print_table_title()
+        print(line)
+        self.lines_printed_since_title += 1
+
+    def run_online_tests(self, ip):
+        if not output_fields:
+            fill=''.ljust(7)
+        elif 'max_length' in output_fields[0] and len(output_fields) > 1:
+            fill=''.ljust(7 + output_fields[0]['max_length'])
+        else:
+            fill=''.ljust(7 + 4)
+        formatter = fill + '  {test_name:<33}: {result}'
+        for online_test in online_tests:
+            result = online_test.run(ip)
+            self.print_table_line(formatter.format(test_name=online_test.get_name(), result=result),
+                                  dontSplit=True)
+
+    def onConnect(self):
+        print('Client session connected.')
+        self.join(self.config.realm)
+
+    def onClose(self, wasClean):
+        print('Got disconnected (cleanly: {})'.format('yes' if wasClean else 'no'))
+        if reactor.running:
+            reactor.stop()
+
+    @inlineCallbacks
+    def onJoin(self, details):
+
+        # Example: tcp4:10.1.34.6:45158
+        tcp4extractor = re.compile(r'tcp4:((?:[0-9]{1,3}\.){3}[0-9]{1,3}):[0-9]+')
+        # "(^|.*; )gwnuid=([0-9a-fA-F]+)($|; .*)"
+        gwnUidExtractor = re.compile(r'(?:^|.*; )gwnuid=([0-9a-fA-F]+)(?:$|; .*)')
+        # u'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/538.1 (KHTML, like Gecko) PLC/4.0 Safari/538.1'
+        uaExtractors = [re.compile(r) for r in [
+                r'(?:^|.* )(PLC\/[0-9.]+)(?:$| .*)',
+                r'(?:^|.* ;)LGE ;([0-9A-Z\-]+)(?:$| .*)',
+                r'(?:^|.* )(Chrome\/[0-9.]+)(?:$| .*)'
+            ]
+        ]
+        def get_transport(session_details):
+            if session_details:
+                if u'transport' in session_details and session_details[u'transport']:
+                    return session_details[u'transport']
+
+        def get_http_headers_received(session_details):
+            transport = get_transport(session_details)
+            if transport and u'http_headers_received' in transport and transport[u'http_headers_received']:
+                return transport[u'http_headers_received']
+
+        def get_ip(session_details, default=None):
+            http_headers_received = get_http_headers_received(session_details)
+            if http_headers_received and u'x-forwarded-for' in http_headers_received:
+                return http_headers_received[u'x-forwarded-for']
+            transport = get_transport(session_details)
+            if transport and u'peer' in transport and transport[u'peer']:
+                result = re.match(tcp4extractor, transport[u'peer'])
+                if result:
+                    return result.group(1)
+            return default
+
+        def get_gwnuid(session_details, default=None):
+            http_headers_received = get_http_headers_received(session_details)
+            if http_headers_received and u'cookie' in http_headers_received and http_headers_received[u'cookie']:
+                result = re.match(gwnUidExtractor, http_headers_received[u'cookie'])
+                if result:
+                    return result.group(1)
+            return default
+
+        def get_device(session_details, default=None):
+            http_headers_received = get_http_headers_received(session_details)
+            if u'user-agent' in http_headers_received and http_headers_received[u'user-agent']:
+                user_agent = http_headers_received[u'user-agent']
+                for extractor in uaExtractors:
+                    result = re.match(extractor, user_agent)
+                    if result:
+                        return result.group(1)
+                return user_agent
+            return default
+
+        def get_connection(session_details):
+            return {
+                    'ip': get_ip(session_details, default='<unknown>'),
+                    'gwnuid': get_gwnuid(session_details, default='<unknown>'),
+                    'device': get_device(session_details, default='<unknown>')
+            }
+
+        self.mySession = details.session
+
+        print('Client session joined (id {my_id}), retrieving full session list'.format(my_id=self.mySession))
+
+        sessions = yield self.call(u'wamp.session.list')
+        sessionCount = 0
+        counts = { }
+        self.sessions = { }
+        if sessions:
+            for session_id in sessions:
+                if self.mySession != session_id:
+                    # Do not list or count our own session
+                    session_details = yield self.call(u'wamp.session.get', session_id)
+                    self.sessions[session_id] = get_connection(session_details)
+                    ip = self.sessions[session_id]['ip']
+                    self.print_table_line('       ' + get_output_fields_formatter()
+                            .format(ip=ip, session=session_id, gwnuid=self.sessions[session_id]['gwnuid'], device=self.sessions[session_id]['device']))
+                    self.run_online_tests(ip)
+
+                    if self.sessions[session_id]['device'] in counts:
+                        counts[self.sessions[session_id]['device']] = counts[self.sessions[session_id]['device']] + 1
+                    else:
+                        counts[self.sessions[session_id]['device']] = 1
+
+            total_devices = 0
+            for device in counts:
+                count = counts[device]
+                print('  {count:>4} {device}'.format(device=device, count=count))
+                total_devices = total_devices + count
+            print('=>{count:>4} total'.format(count=total_devices))
+        else:
+            # This should probably never happen since _we_ just connected
+            print('  No sessions active')
+
+        if one_shot:
+            yield self.leave()
+
+        print()
+        print('Waiting for new/leaving sessions... (press CTRL+C at any time to stop)')
+
+        def on_session_join(session_details):
+            if session_details:
+                session_id = session_details['session']
+                self.sessions[session_id] = get_connection(session_details)
+                ip = self.sessions[session_id]['ip']
+                self.print_table_line('  new: ' + get_output_fields_formatter()
+                        .format(ip=ip, session=session_id, gwnuid=self.sessions[session_id]['gwnuid'], device=self.sessions[session_id]['device']))
+                time.sleep(2)
+                self.run_online_tests(ip)
+            else:
+                self.print_table_line('  new: <no details>')
+
+        yield self.subscribe(on_session_join, u'wamp.session.on_join')
+
+        def on_session_leave(session_id):
+            if session_id in self.sessions:
+                self.print_table_line(' gone: ' + get_output_fields_formatter()
+                        .format(ip=self.sessions[session_id]['ip'], session=session_id, gwnuid=self.sessions[session_id]['gwnuid'], device=self.sessions[session_id]['device']))
+                del self.sessions[session_id]
+            else:
+                self.print_table_line(' gone: <unknown session>')
+
+        yield self.subscribe(on_session_leave, u'wamp.session.on_leave')
+
+if __name__ == '__main__':
+
+    def field_arg(arg):
+        fields = []
+        unknown_fields = []
+        for arg_part in arg.split(','):
+            field = None
+            for available_field in available_fields:
+                if available_field['field'] == arg_part:
+                    field=available_field
+                    break
+            if field:
+                fields.append(available_field)
+            else:
+                unknown_fields.append(arg_part)
+        if unknown_fields:
+            raise argparse.ArgumentTypeError('Unknown fields: {}'.format(', '.join([field if field else '""' for field in unknown_fields])))
+        return fields
+
+    parser = argparse.ArgumentParser()
+
+    #parser.add_argument('-d', '--debug', action='store_true', help='Enable debug output.')
+    parser.add_argument('--url', dest='url', type=six.text_type, default=u'ws://127.0.0.1:8888/ws', help='The router URL (default: "ws://127.0.0.1:8888/ws").')
+    parser.add_argument('--realm', dest='realm', type=six.text_type, default=u'realm1', help='The realm to join (default: "realm1").')
+    parser.add_argument('--test-inet', dest='inet_test_domain', type=six.text_type, help='A test domain (hostname) for SquidAuth. If specified each active connection is tested").')
+    parser.add_argument('--fields', dest='fields', type=field_arg, default=u'ip,gwnuid,device', help='List of fields to output for each device (comma separated). Possible values: {values_list}. NOTE: "device" is not length-restricted and should always be used last.'.format(values_list=', '.join([field['field'] for field in available_fields])))
+    parser.add_argument('--lines-without-header', dest='max_lines_without_header', type=int, default=20, help='Print a header after this many lines (set to 0 to turn off)')
+    parser.add_argument('--one-shot', dest='one_shot', action='store_true', help='Try to connect to Crossbar, list all existing connections and then exit with status 0. If a connection cannot be established exit with a non-zero exit code.')
+
+    args = parser.parse_args()
+
+    output_fields = args.fields
+    max_lines_without_header = args.max_lines_without_header 
+    one_shot = args.one_shot
+    if args.inet_test_domain:
+      online_tests.append(CheckInternet(args.inet_test_domain))
+
+    print('Connecting to: {}'.format(args.url))
+
+    runner = ApplicationRunner(url=args.url, realm=args.realm)
+    runner.run(ClientSession) # , auto_reconnect=True
+
+# vim: filetype=python tabstop=4 expandtab shiftwidth=4 softtabstop=4
