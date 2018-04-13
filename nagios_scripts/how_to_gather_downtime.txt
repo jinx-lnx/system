@@ -1,0 +1,5 @@
+##This will give you a list of all the dowmtime ID's to put in a file to loop through
+cat /var/cache/nagios/status.dat | grep -A3 servicedowntime |grep -A3 -E 'tspm|bay-e|glm|gtu|fce|nsb|fom|fws|foc|fcar|has' |grep downtime_id | sed -e 's/downtime_id=//g' >>downtimeid_list.txt
+
+##This will give you a list of all the comment ID's to put in a file to loop through
+cat /var/cache/nagios/status.dat | grep -A4 -E 'servicecomment|hostcomment' |grep -A3 -E 'tspm|bay-e|glm|gtu|fce|nsb|fom|fws|foc|fcar|has|wjm|cmg' |grep comment_id | sed -e 's/comment_id=//g' >>commentid_list.txt
